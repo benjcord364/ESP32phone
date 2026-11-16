@@ -1,6 +1,6 @@
 {
-  "build": 2,
-  "version": "1.0.1",
+  "build": 1,
+  "version": "1.0.0",
   "notes": "Test version check",
   "url": "https://raw.githubusercontent.com/benjcord364/ESP32phone/main/ESP32code"
 }
