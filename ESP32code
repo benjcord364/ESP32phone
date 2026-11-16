@@ -1,0 +1,3336 @@
+#define LGFX_USE_V1
+#include <LovyanGFX.hpp>
+#include <FT6336U.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <Preferences.h>
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
+#include <ArduinoJson.h>
+#include <ctype.h>
+#include <time.h>
+#include <math.h>
+#include <vector>
+
+// >>>>>>>>>> PASTE YOUR NEW OPENROUTER KEY HERE (keep the quotes) <<<<<<<<<<
+// First USB upload: put your real key here. It gets saved on the phone.
+// For the file you share on GitHub: put PASTE_NEW_KEY_HERE back before exporting.
+String openRouterKey = "PASTE_NEW_KEY_HERE";
+
+// ---------- Software update settings ----------
+const int FW_BUILD = 1;                 // bump this number for every release
+const char* FW_VERSION = "1.0.0";       // shown on screen
+// Link to your version.json on GitHub (must be a raw.githubusercontent.com link)
+const char* UPDATE_URL = "https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/version.json";
+
+const char* TIME_ZONE = "CST6CDT,M3.2.0,M11.1.0";
+
+Preferences preferences;
+
+class LGFX : public lgfx::LGFX_Device {
+  lgfx::Panel_ST7796 _panel;
+  lgfx::Bus_SPI _bus;
+  lgfx::Light_PWM _light;
+public:
+  LGFX(void) {
+    {
+      auto cfg = _bus.config();
+      cfg.spi_host = SPI2_HOST;
+      cfg.spi_mode = 0;
+      cfg.freq_write = 40000000;
+      cfg.freq_read = 16000000;
+      cfg.spi_3wire = false;
+      cfg.use_lock = true;
+      cfg.dma_channel = SPI_DMA_CH_AUTO;
+      cfg.pin_sclk = 12;
+      cfg.pin_mosi = 11;
+      cfg.pin_miso = 13;
+      cfg.pin_dc = 46;
+      _bus.config(cfg);
+      _panel.setBus(&_bus);
+    }
+    {
+      auto cfg = _panel.config();
+      cfg.pin_cs = 10;
+      cfg.pin_rst = -1;
+      cfg.pin_busy = -1;
+      cfg.panel_width = 320;
+      cfg.panel_height = 480;
+      cfg.offset_x = 0;
+      cfg.offset_y = 0;
+      cfg.offset_rotation = 0;
+      cfg.dummy_read_pixel = 8;
+      cfg.dummy_read_bits = 1;
+      cfg.readable = true;
+      cfg.invert = false;
+      cfg.rgb_order = false;
+      cfg.dlen_16bit = false;
+      cfg.bus_shared = true;
+      _panel.config(cfg);
+    }
+    {
+      auto cfg = _light.config();
+      cfg.pin_bl = 45;
+      cfg.invert = false;
+      cfg.freq = 44100;
+      cfg.pwm_channel = 7;
+      _light.config(cfg);
+      _panel.setLight(&_light);
+    }
+    setPanel(&_panel);
+  }
+};
+
+LGFX tft;
+lgfx::LGFX_Sprite spr(&tft);        // off-screen canvas (needs PSRAM)
+lgfx::LGFXBase* gfx = &tft;         // where draw functions currently draw
+bool haveSpr = false;
+FT6336U ft6336u(16, 15, 18, 17);
+
+// ---------------- Color helpers ----------------
+struct Col { uint8_t r, g, b; };
+static inline uint16_t c565(int r, int gr, int b) {
+  return (uint16_t)(((r & 0xF8) << 8) | ((gr & 0xFC) << 3) | ((b & 0xFF) >> 3));
+}
+static inline uint16_t c565v(const Col &c) { return c565(c.r, c.g, c.b); }
+static Col lerpCol(const Col &a, const Col &b, float t) {
+  if (t < 0) t = 0;
+  if (t > 1) t = 1;
+  Col o;
+  o.r = (uint8_t)(a.r + (b.r - a.r) * t);
+  o.g = (uint8_t)(a.g + (b.g - a.g) * t);
+  o.b = (uint8_t)(a.b + (b.b - a.b) * t);
+  return o;
+}
+
+struct Wall { const char* name; Col top, mid, bot; };
+const int WALL_COUNT = 6;
+const Wall WALLS[WALL_COUNT] = {
+  {"Sunset",   {45, 27, 92},  {214, 72, 120}, {255, 170, 80}},
+  {"Ocean",    {8, 24, 64},   {16, 96, 140},  {70, 190, 200}},
+  {"Aurora",   {6, 10, 30},   {12, 50, 70},   {20, 90, 80}},
+  {"Forest",   {120, 190, 230}, {170, 220, 200}, {60, 130, 80}},
+  {"Midnight", {2, 4, 16},    {14, 20, 60},   {40, 40, 110}},
+  {"Candy",    {255, 150, 200}, {190, 140, 240}, {120, 190, 255}}
+};
+
+// ---------------- Home screen layout ----------------
+// App ids: 0 Weather, 1 AI, 2 Snake, 3 Settings, 4 Calc, 5 Wi-Fi, 6 Wallpaper, 8 Notes, 9 Clock
+// Grid = 2 rows x 4 columns (-1 = empty slot). Dock = 4 apps.
+const int HOME_GRID[8] = {2, 5, 6, 8, 9, -1, -1, -1};
+const int HOME_DOCK[4] = {0, 1, 4, 3};
+const char* APP_NAMES[10] = {"Weather", "AI", "Snake", "Settings", "Calc", "Wi-Fi", "Wallpaper", "", "Notes", "Clock"};
+
+// ---------------- State ----------------
+enum Screen { HOME, SETTINGS, WIFI_LIST, WIFI_PASSWORD, AI_CHAT, WEATHER, LOC_SEARCH, LOC_LIST, LOCK, PIN_SET, GAME, WALL_PICK, CALC, NOTES_LIST, NOTE_EDIT, CLOCK, UPDATE };
+Screen currentScreen = HOME;
+bool fromHome = false;   // true when Wi-Fi / Wallpaper were opened from the home screen
+
+bool darkTheme = false;
+int brightness = 200;
+bool sliderDrag = false;
+int wallIdx = 0;
+
+String wifiSSID = "";
+String wifiPASS = "";
+bool wifiConnected = false;
+
+int networkCount = 0;
+String networks[15];
+int networkRssi[15];
+bool networkSecure[15];
+bool wifiScanning = false;
+int selectedNetwork = -1;
+
+String passwordInput = "";
+bool keyboardShift = false;
+
+String lockPin = "1234";
+String pinEntry = "";
+String lockMsg = "";
+String newPin = "";
+String pinSetMsg = "";
+
+// AI chat (what you see) + conversation memory (what the AI sees)
+String aiInput = "";
+const int MAX_CHAT = 20;
+String chatHistory[MAX_CHAT];
+int chatCount = 0;
+bool aiThinking = false;
+bool showAIKeyboard = false;
+bool aiKeyboardShift = false;
+
+const int CONV_MAX = 10;
+String convText[CONV_MAX];
+bool convUser[CONV_MAX];
+int convCount = 0;
+
+float wxLat = 34.6826;
+float wxLon = -85.8044;
+String wxPlace = "Pisgah, AL";
+bool useMetric = false;
+bool wxValid = false;
+String wxError = "";
+float wxTemp, wxFeels, wxWind;
+int wxHum, wxCode;
+String wxDate[5];
+int wxDayCode[5];
+float wxHi[5], wxLo[5];
+
+String locInput = "";
+bool locShift = false;
+String locMsg = "";
+int locCount = 0;
+String locName[8], locAdmin[8], locCountry[8];
+float locLat[8], locLon[8];
+
+// Snake
+const int SN_COLS = 16, SN_ROWS = 18, SN_CELL = 20, SN_X0 = 0, SN_Y0 = 52;
+enum SState { SN_READY, SN_PLAY, SN_DEAD };
+SState snState = SN_READY;
+uint8_t snX[SN_COLS * SN_ROWS], snY[SN_COLS * SN_ROWS];
+int snLen = 3;
+int snDx = 1, snDy = 0, snNx = 1, snNy = 0;
+int snFoodX = 0, snFoodY = 0;
+int snScore = 0, snBest = 0;
+unsigned long snLast = 0, snDeadAt = 0;
+int snSwipeX = 0, snSwipeY = 0;
+
+// Notes
+const int MAX_NOTES = 8;
+const int NOTE_LEN = 220;
+String notes[MAX_NOTES];
+int noteCount = 0;
+int curNote = -1;
+bool noteShift = false;
+
+// Clock app (clock / timer / stopwatch)
+int clockTab = 0;                       // 0 clock, 1 timer, 2 stopwatch
+long timerSetSec = 300;
+long timerRemainMs = 300000;
+bool timerRunning = false, timerDone = false, timerFlash = false;
+unsigned long timerEndMs = 0, timerDoneAt = 0, timerLastFlash = 0;
+long lastTimerSec = -1;
+bool swRunning = false;
+unsigned long swStartMs = 0, swAccum = 0;
+unsigned long swLaps[20];
+int swLapCount = 0;
+int clkLastSec = -1, clkLastMin = -1;
+int prevH = -1, prevM = -1, prevS = -1;
+const int CLK_CX = 160, CLK_CY = 215, CLK_R = 100;
+
+// Software update
+enum UState { U_IDLE, U_CHECKING, U_UPTODATE, U_AVAIL, U_ERROR, U_INSTALL };
+UState updState = U_IDLE;
+bool updAvail = false;
+int updNewBuild = 0;
+String updNewVer = "";
+String updNotes = "";
+String updUrl = "";
+String updMsg = "";
+int updLastPct = -1;
+
+uint16_t bgColor, textColor, cardColor, statusBarColor, subColor, sepColor;
+uint16_t keyBgColor, keyFaceColor, keySpecialColor, keyShadowColor, bubbleAiColor;
+uint16_t accentColor, greenColor, redColor;
+
+int16_t touchStartY = -1, touchLastY = -1;
+bool touching = false;
+
+// ---------------- Prototypes ----------------
+void applyTheme();
+void setBrightness(int v);
+void saveSettings();
+void loadSettings();
+void beginFull();
+void endFull(int anim = 0);
+void drawHomeScreen(int anim = 0);
+void drawSettingsScreen(int anim = 0);
+void drawBrightnessSlider();
+void drawWifiList(int anim = 0);
+void drawPasswordScreen(int anim = 0);
+void drawAIChat(int anim = 0);
+void drawWeather(bool loading, int anim = 0);
+void drawLocSearch(int anim = 0);
+void drawLocList(int anim = 0);
+void drawLockScreen(int anim = 0);
+void drawPinSet(int anim = 0);
+void drawWallPicker(int anim = 0);
+void drawCalc(int anim = 0);
+void drawNotesList(int anim = 0);
+void drawNoteEdit(int anim = 0);
+void drawNoteTextArea();
+void drawClock(int anim = 0);
+void drawUpdate(int anim = 0);
+void drawGoodKeyboard(bool shiftState);
+void updateInputField(const String& text);
+void updateAIInputField();
+void scanWiFi();
+void connectWiFi();
+void tryAutoConnect();
+void syncTime();
+void lockNow();
+void handlePasswordTouch(int tx, int ty);
+void handleAITouch(int tx, int ty);
+void handleLocSearchTouch(int tx, int ty);
+void handleLocListTouch(int tx, int ty);
+void handleLockTouch(int tx, int ty);
+void handlePinSetTouch(int tx, int ty);
+void handleCalcTouch(int tx, int ty);
+void handleNotesListTouch(int tx, int ty);
+void handleNoteEditTouch(int tx, int ty);
+void handleClockTouch(int tx, int ty);
+void handleUpdateTouch(int tx, int ty);
+void clockTick();
+void sendToAI(String message);
+void addChat(const String& s);
+void convAdd(bool user, const String &t);
+void wrapText(const String &s, int maxChars, std::vector<String> &out);
+void fetchWeather(int anim = 0);
+bool wxDownload();
+bool searchLocations(const String& q);
+void snakeNewGame(bool start);
+void snakeStep();
+void snakeTap();
+void snakeSwipe(int tx, int ty);
+void goBack();
+void openApp(int i);
+void openUpdate();
+void applySliderTouch(int tx);
+void finishNote();
+void saveNotes();
+bool updCheck();
+void updInstall();
+bool handleKeyboardKey(int tx, int ty, String &buf, bool &shift);
+
+// =====================================================
+// DRAW TARGET + TRANSITIONS
+void beginFull() {
+  gfx = haveSpr ? (lgfx::LGFXBase*)&spr : (lgfx::LGFXBase*)&tft;
+}
+
+// anim: 0 none, 1 slide from right, 2 from left, 3 from bottom, 4 from top
+void endFull(int anim) {
+  gfx = &tft;
+  if (!haveSpr) return;
+  if (anim == 0) {
+    spr.pushSprite(0, 0);
+    return;
+  }
+  const float fr[6] = {0.35f, 0.62f, 0.80f, 0.92f, 0.98f, 1.0f};
+  for (int i = 0; i < 6; i++) {
+    if (anim == 1) spr.pushSprite(320 - (int)(320 * fr[i]), 0);
+    else if (anim == 2) spr.pushSprite(-320 + (int)(320 * fr[i]), 0);
+    else if (anim == 3) spr.pushSprite(0, 480 - (int)(480 * fr[i]));
+    else spr.pushSprite(0, -480 + (int)(480 * fr[i]));
+  }
+}
+
+// =====================================================
+// DRAWING HELPERS
+void drawGradientV(int x, int y, int w, int h, const Col &top, const Col &bot) {
+  for (int j = 0; j < h; j += 2) {
+    int hh = (h - j >= 2) ? 2 : (h - j);
+    gfx->fillRect(x, y + j, w, hh, c565v(lerpCol(top, bot, h > 1 ? (float)j / (h - 1) : 0.0f)));
+  }
+}
+
+void shadowText(const String &s, int x, int y, int font, uint16_t col) {
+  gfx->setTextColor(c565(10, 10, 30));
+  gfx->drawString(s, x + 1, y + 1, font);
+  gfx->setTextColor(col);
+  gfx->drawString(s, x, y, font);
+}
+
+Col wallColorAt(int idx, float t) {
+  const Wall &W = WALLS[idx];
+  return t < 0.5f ? lerpCol(W.top, W.mid, t * 2) : lerpCol(W.mid, W.bot, (t - 0.5f) * 2);
+}
+
+uint16_t glassAt(int y, float a) {
+  Col c = wallColorAt(wallIdx, y / 480.0f);
+  return c565v(lerpCol(c, Col{255, 255, 255}, a));
+}
+
+void drawStars(int x, int y, int w, int h, int n, uint32_t seed, float maxFy) {
+  for (int i = 0; i < n; i++) {
+    seed = seed * 1664525u + 1013904223u;
+    int px = x + (int)((seed >> 8) % (uint32_t)w);
+    seed = seed * 1664525u + 1013904223u;
+    int py = y + (int)(((seed >> 8) % 1000) / 1000.0f * maxFy * h);
+    seed = seed * 1664525u + 1013904223u;
+    int br = 150 + (int)((seed >> 8) % 105);
+    uint16_t c = c565(br, br, br);
+    if (w > 200 && i % 7 == 0) gfx->fillCircle(px, py, 1, c);
+    else gfx->drawPixel(px, py, c);
+  }
+}
+
+void drawHill(int x, int y, int w, int h, float baseF, float ampF, float freq, float phase, uint16_t col) {
+  int step = (w > 200) ? 2 : 1;
+  for (int cx = 0; cx < w; cx += step) {
+    float yy = h * baseF + h * ampF * sinf(freq * 6.2832f * cx / w + phase);
+    int yi = (int)yy;
+    if (yi < 0) yi = 0;
+    if (yi >= h) continue;
+    gfx->fillRect(x + cx, y + yi, step, h - yi, col);
+  }
+}
+
+void drawWallpaper(int idx, int x, int y, int w, int h) {
+  gfx->setClipRect(x, y, w, h);
+  for (int j = 0; j < h; j += 2) {
+    int hh = (h - j >= 2) ? 2 : (h - j);
+    gfx->fillRect(x, y + j, w, hh, c565v(wallColorAt(idx, h > 1 ? (float)j / (h - 1) : 0.0f)));
+  }
+  float s = w / 320.0f;
+  auto PX = [&](float f) -> int { return x + (int)(f * w); };
+  auto PY = [&](float f) -> int { return y + (int)(f * h); };
+
+  switch (idx) {
+    case 0: {  // Sunset
+      int cx = PX(0.5f), cy = PY(0.60f);
+      for (int k = 3; k >= 0; k--) {
+        Col c = lerpCol(wallColorAt(0, 0.6f), Col{255, 226, 140}, k == 0 ? 1.0f : 0.18f * (4 - k));
+        gfx->fillCircle(cx, cy, (int)((46 + k * 16) * s), c565v(c));
+      }
+      drawHill(x, y, w, h, 0.72f, 0.030f, 1.2f, 0.0f, c565(60, 24, 80));
+      drawHill(x, y, w, h, 0.80f, 0.035f, 0.8f, 1.5f, c565(36, 14, 56));
+      drawHill(x, y, w, h, 0.90f, 0.030f, 1.5f, 3.0f, c565(20, 8, 34));
+      break;
+    }
+    case 1: {  // Ocean
+      gfx->fillCircle(PX(0.76f), PY(0.17f), (int)(20 * s), c565(240, 240, 225));
+      drawHill(x, y, w, h, 0.60f, 0.015f, 3.0f, 0.0f, c565(26, 120, 160));
+      drawHill(x, y, w, h, 0.70f, 0.018f, 2.5f, 1.0f, c565(18, 96, 138));
+      drawHill(x, y, w, h, 0.81f, 0.020f, 2.0f, 2.0f, c565(12, 72, 112));
+      drawHill(x, y, w, h, 0.92f, 0.020f, 1.5f, 3.0f, c565(8, 48, 86));
+      break;
+    }
+    case 2: {  // Aurora
+      drawStars(x, y, w, h, 60, 7, 0.6f);
+      int step = (w > 200) ? 3 : 1;
+      int seg = (int)(5 * s);
+      if (seg < 2) seg = 2;
+      for (int b = 0; b < 2; b++) {
+        Col ac = (b == 0) ? Col{60, 255, 160} : Col{150, 90, 255};
+        float baseF = 0.30f + b * 0.14f;
+        Col bg = wallColorAt(2, baseF);
+        uint16_t cc[15];
+        for (int m = -7; m <= 7; m++) {
+          float a = (1.0f - fabsf((float)m) / 8.0f) * 0.6f;
+          cc[m + 7] = c565v(lerpCol(bg, ac, a));
+        }
+        for (int cx = 0; cx < w; cx += step) {
+          int yy = (int)(h * (baseF + 0.05f * sinf(6.2832f * 1.3f * cx / w + b * 2.0f)));
+          for (int m = -7; m <= 7; m++) {
+            gfx->fillRect(x + cx, y + yy + m * seg, step, seg + 1, cc[m + 7]);
+          }
+        }
+      }
+      drawHill(x, y, w, h, 0.86f, 0.030f, 1.5f, 0.0f, c565(4, 20, 22));
+      drawHill(x, y, w, h, 0.93f, 0.030f, 2.0f, 1.0f, c565(2, 12, 14));
+      break;
+    }
+    case 3: {  // Forest
+      int cx = PX(0.78f), cy = PY(0.18f);
+      for (int k = 2; k >= 0; k--) {
+        Col c = lerpCol(wallColorAt(3, 0.18f), Col{255, 250, 210}, k == 0 ? 1.0f : 0.25f * (3 - k));
+        gfx->fillCircle(cx, cy, (int)((24 + k * 12) * s), c565v(c));
+      }
+      gfx->fillTriangle(PX(0.0f), PY(0.78f), PX(0.28f), PY(0.40f), PX(0.58f), PY(0.78f), c565(96, 150, 140));
+      gfx->fillTriangle(PX(0.35f), PY(0.80f), PX(0.65f), PY(0.34f), PX(1.0f), PY(0.80f), c565(70, 124, 112));
+      gfx->fillTriangle(PX(-0.1f), PY(0.85f), PX(0.2f), PY(0.55f), PX(0.5f), PY(0.85f), c565(46, 100, 84));
+      drawHill(x, y, w, h, 0.80f, 0.030f, 1.0f, 0.5f, c565(30, 84, 56));
+      drawHill(x, y, w, h, 0.90f, 0.030f, 1.3f, 2.0f, c565(18, 60, 40));
+      break;
+    }
+    case 4: {  // Midnight
+      drawStars(x, y, w, h, 140, 3, 0.85f);
+      int cx = PX(0.74f), cy = PY(0.18f);
+      gfx->fillCircle(cx, cy, (int)(26 * s), c565(245, 240, 210));
+      gfx->fillCircle(cx + (int)(10 * s), cy - (int)(5 * s), (int)(22 * s), c565v(wallColorAt(4, 0.18f)));
+      break;
+    }
+    case 5: {  // Candy
+      Col wh = {255, 255, 255};
+      gfx->fillCircle(PX(0.15f), PY(0.22f), (int)(95 * s), c565v(lerpCol(wallColorAt(5, 0.22f), wh, 0.22f)));
+      gfx->fillCircle(PX(0.95f), PY(0.55f), (int)(115 * s), c565v(lerpCol(wallColorAt(5, 0.55f), wh, 0.18f)));
+      gfx->fillCircle(PX(0.30f), PY(0.90f), (int)(85 * s), c565v(lerpCol(wallColorAt(5, 0.90f), Col{255, 210, 230}, 0.35f)));
+      gfx->fillCircle(PX(0.75f), PY(0.15f), (int)(30 * s), c565v(lerpCol(wallColorAt(5, 0.15f), wh, 0.40f)));
+      break;
+    }
+  }
+  gfx->clearClipRect();
+}
+
+// =====================================================
+// ICONS
+void cloudShape(int cx, int cy, float f, uint16_t col) {
+  gfx->fillCircle(cx - (int)(12 * f), cy + (int)(4 * f), (int)(9 * f), col);
+  gfx->fillCircle(cx, cy - (int)(3 * f), (int)(13 * f), col);
+  gfx->fillCircle(cx + (int)(13 * f), cy + (int)(3 * f), (int)(10 * f), col);
+  gfx->fillRoundRect(cx - (int)(21 * f), cy + (int)(2 * f), (int)(43 * f), (int)(13 * f), (int)(6 * f), col);
+}
+
+void sunShape(int cx, int cy, float f, uint16_t col) {
+  gfx->fillCircle(cx, cy, (int)(11 * f), col);
+  int rr = (int)(2.2f * f);
+  if (rr < 1) rr = 1;
+  for (int k = 0; k < 8; k++) {
+    float a = k * 0.7854f;
+    gfx->fillCircle(cx + (int)(cosf(a) * 18 * f), cy + (int)(sinf(a) * 18 * f), rr, col);
+  }
+}
+
+void sparkle(int cx, int cy, int R, uint16_t col) {
+  int r = R * 28 / 100;
+  if (r < 1) r = 1;
+  gfx->fillTriangle(cx, cy - R, cx + r, cy, cx, cy + R, col);
+  gfx->fillTriangle(cx, cy - R, cx - r, cy, cx, cy + R, col);
+  gfx->fillTriangle(cx - R, cy, cx, cy - r, cx + R, cy, col);
+  gfx->fillTriangle(cx - R, cy, cx, cy + r, cx + R, cy, col);
+}
+
+// ring segment between radii r0..r1 from angle d0 to d1 (degrees, 270 = straight up)
+void arcRing(int cx, int cy, float r0, float r1, float d0, float d1, uint16_t col) {
+  float step = 8.0f;
+  for (float a = d0; a < d1; a += step) {
+    float b = a + step;
+    if (b > d1) b = d1;
+    float ra = a * 0.0174533f, rb = b * 0.0174533f;
+    int x0a = cx + (int)(cosf(ra) * r0), y0a = cy + (int)(sinf(ra) * r0);
+    int x1a = cx + (int)(cosf(ra) * r1), y1a = cy + (int)(sinf(ra) * r1);
+    int x0b = cx + (int)(cosf(rb) * r0), y0b = cy + (int)(sinf(rb) * r0);
+    int x1b = cx + (int)(cosf(rb) * r1), y1b = cy + (int)(sinf(rb) * r1);
+    gfx->fillTriangle(x0a, y0a, x1a, y1a, x1b, y1b, col);
+    gfx->fillTriangle(x0a, y0a, x1b, y1b, x0b, y0b, col);
+  }
+}
+
+void thickLine(int x0, int y0, int x1, int y1, int t, uint16_t col) {
+  for (int o = -(t / 2); o <= t / 2; o++) {
+    gfx->drawLine(x0 + o, y0, x1 + o, y1, col);
+    gfx->drawLine(x0, y0 + o, x1, y1 + o, col);
+  }
+}
+
+void drawWxIcon(int code, int cx, int cy, int size) {
+  float f = size / 64.0f;
+  uint16_t white = c565(255, 255, 255), gray = c565(214, 220, 228), sunC = c565(255, 205, 40);
+  uint16_t dropC = c565(90, 170, 255), boltC = c565(255, 220, 60), snowC = c565(190, 225, 255);
+  if (code == 0) {
+    sunShape(cx, cy, f * 1.35f, sunC);
+  } else if (code == 1 || code == 2) {
+    sunShape(cx - (int)(10 * f), cy - (int)(10 * f), f, sunC);
+    cloudShape(cx + (int)(4 * f), cy + (int)(8 * f), f, white);
+  } else if (code == 3 || code == 45 || code == 48) {
+    cloudShape(cx, cy - (int)(2 * f), f * 1.1f, gray);
+    if (code != 3) {
+      for (int i = 0; i < 3; i++)
+        gfx->fillRoundRect(cx - (int)(22 * f), cy + (int)((16 + i * 6) * f), (int)(44 * f), (int)(3 * f) + 1, 1, gray);
+    }
+  } else if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) {
+    cloudShape(cx, cy - (int)(8 * f), f, gray);
+    int dw = (int)(3 * f);
+    if (dw < 2) dw = 2;
+    for (int i = 0; i < 3; i++)
+      gfx->fillRoundRect(cx - (int)(14 * f) + i * (int)(12 * f), cy + (int)(12 * f), dw, (int)(10 * f), 1, dropC);
+  } else if ((code >= 71 && code <= 77) || code == 85 || code == 86) {
+    cloudShape(cx, cy - (int)(8 * f), f, gray);
+    int dr = (int)(2.5f * f);
+    if (dr < 1) dr = 1;
+    for (int i = 0; i < 3; i++)
+      gfx->fillCircle(cx - (int)(14 * f) + i * (int)(14 * f), cy + (int)((14 + (i % 2) * 6) * f), dr, snowC);
+  } else {
+    cloudShape(cx, cy - (int)(8 * f), f, c565(120, 128, 145));
+    gfx->fillTriangle(cx + (int)(4 * f), cy + (int)(6 * f), cx - (int)(6 * f), cy + (int)(19 * f), cx + (int)(1 * f), cy + (int)(19 * f), boltC);
+    gfx->fillTriangle(cx + (int)(1 * f), cy + (int)(15 * f), cx + (int)(9 * f), cy + (int)(15 * f), cx - (int)(3 * f), cy + (int)(28 * f), boltC);
+  }
+}
+
+void drawTile(int x, int y, int s, const Col &top, const Col &bot) {
+  int r = (int)(s * 0.23f);
+  int bands = 10;
+  for (int k = 0; k < bands; k++) {
+    int y0 = k * s / bands, y1 = (k + 1) * s / bands;
+    gfx->setClipRect(x, y + y0, s, y1 - y0 + 1);
+    gfx->fillRoundRect(x, y, s, s, r, c565v(lerpCol(top, bot, (float)k / (bands - 1))));
+  }
+  gfx->clearClipRect();
+}
+
+// id: 0 weather, 1 AI, 2 snake, 3 settings, 4 calculator, 5 wifi, 6 wallpaper, 8 notes, 9 clock
+void drawAppIcon(int id, int x, int y, int s) {
+  float f = s / 64.0f;
+  auto P = [&](float v) -> int { return x + (int)(v * f); };
+  auto Q = [&](float v) -> int { return y + (int)(v * f); };
+  uint16_t white = c565(255, 255, 255);
+  switch (id) {
+    case 0:
+      drawTile(x, y, s, Col{90, 170, 255}, Col{30, 100, 230});
+      sunShape(P(22), Q(24), f * 0.95f, c565(255, 214, 10));
+      cloudShape(P(35), Q(40), f * 0.9f, white);
+      break;
+    case 1:
+      drawTile(x, y, s, Col{175, 125, 255}, Col{90, 60, 220});
+      sparkle(P(28), Q(34), (int)(20 * f), white);
+      sparkle(P(47), Q(17), (int)(8 * f), white);
+      sparkle(P(47), Q(48), (int)(9 * f), white);
+      break;
+    case 2: {  // snake
+      drawTile(x, y, s, Col{140, 215, 90}, Col{50, 150, 70});
+      int t = (int)(8 * f);
+      if (t < 3) t = 3;
+      uint16_t sb = c565(60, 110, 240);
+      int vx[5] = {14, 30, 30, 46, 46};
+      int vy[5] = {46, 46, 30, 30, 16};
+      for (int k = 0; k < 4; k++) thickLine(P(vx[k]), Q(vy[k]), P(vx[k + 1]), Q(vy[k + 1]), t, sb);
+      for (int k = 0; k < 5; k++) gfx->fillCircle(P(vx[k]), Q(vy[k]), t / 2, sb);
+      gfx->fillCircle(P(46), Q(16), (int)(6 * f) + 1, c565(40, 85, 220));
+      int er = (int)(2 * f);
+      if (er < 1) er = 1;
+      gfx->fillCircle(P(43), Q(14), er, white);
+      gfx->fillCircle(P(49), Q(14), er, white);
+      gfx->fillCircle(P(14), Q(22), (int)(6 * f) + 1, c565(230, 50, 50));
+      gfx->fillRect(P(14), Q(14), (int)(2 * f) + 1, (int)(4 * f) + 1, c565(90, 60, 30));
+      break;
+    }
+    case 4: {  // calculator
+      drawTile(x, y, s, Col{88, 92, 104}, Col{44, 46, 56});
+      gfx->fillRoundRect(P(10), Q(9), (int)(44 * f), (int)(14 * f), (int)(4 * f), c565(190, 225, 200));
+      for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 4; c++) {
+          uint16_t kc = (c == 3) ? c565(255, 159, 10) : c565(235, 235, 240);
+          gfx->fillRoundRect(P(10 + c * 12), Q(28 + r * 11), (int)(9 * f) + 1, (int)(8 * f) + 1, (int)(2 * f), kc);
+        }
+      }
+      break;
+    }
+    case 5: {  // wifi
+      drawTile(x, y, s, Col{70, 170, 255}, Col{20, 90, 220});
+      int cx = P(32), cy = Q(44);
+      gfx->fillCircle(cx, cy, (int)(3.5f * f) + 1, white);
+      arcRing(cx, cy, 10 * f, 14 * f, 225, 315, white);
+      arcRing(cx, cy, 19 * f, 23 * f, 225, 315, white);
+      arcRing(cx, cy, 28 * f, 32 * f, 225, 315, white);
+      break;
+    }
+    case 6: {  // wallpaper
+      drawTile(x, y, s, Col{255, 140, 110}, Col{150, 80, 220});
+      gfx->fillCircle(P(44), Q(20), (int)(7 * f), c565(255, 230, 140));
+      gfx->fillTriangle(P(6), Q(56), P(24), Q(26), P(42), Q(56), c565(255, 255, 255));
+      gfx->fillTriangle(P(28), Q(56), P(44), Q(34), P(60), Q(56), c565(235, 225, 255));
+      break;
+    }
+    case 8: {  // notes
+      drawTile(x, y, s, Col{255, 226, 100}, Col{255, 180, 30});
+      gfx->fillRoundRect(P(15), Q(11), (int)(34 * f), (int)(42 * f), (int)(5 * f), white);
+      gfx->fillRoundRect(P(15), Q(11), (int)(34 * f), (int)(10 * f), (int)(4 * f), c565(255, 200, 45));
+      for (int i = 0; i < 3; i++)
+        gfx->fillRect(P(20), Q(27 + i * 8), (int)(24 * f), (int)(2 * f) + 1, c565(200, 200, 205));
+      break;
+    }
+    case 9: {  // clock
+      drawTile(x, y, s, Col{70, 70, 78}, Col{12, 12, 16});
+      gfx->fillCircle(P(32), Q(32), (int)(24 * f), white);
+      int t = (int)(2.2f * f);
+      if (t < 2) t = 2;
+      uint16_t blk = c565(20, 20, 24);
+      thickLine(P(32), Q(32), P(32), Q(17), t, blk);
+      thickLine(P(32), Q(32), P(43), Q(38), t, blk);
+      gfx->drawLine(P(32), Q(32), P(24), Q(42), c565(255, 69, 58));
+      gfx->fillCircle(P(32), Q(32), (int)(2.2f * f) + 1, c565(255, 69, 58));
+      gfx->fillCircle(P(32), Q(13), (int)(1.5f * f) + 1, c565(150, 150, 155));
+      gfx->fillCircle(P(32), Q(51), (int)(1.5f * f) + 1, c565(150, 150, 155));
+      gfx->fillCircle(P(13), Q(32), (int)(1.5f * f) + 1, c565(150, 150, 155));
+      gfx->fillCircle(P(51), Q(32), (int)(1.5f * f) + 1, c565(150, 150, 155));
+      break;
+    }
+    default: {
+      Col t = {175, 180, 190}, b = {100, 105, 116};
+      drawTile(x, y, s, t, b);
+      for (int k = 0; k < 8; k++) {
+        float a = k * 0.7854f;
+        gfx->fillCircle(P(32) + (int)(cosf(a) * 19 * f), Q(32) + (int)(sinf(a) * 19 * f), (int)(4.5f * f), white);
+      }
+      gfx->fillCircle(P(32), Q(32), (int)(17 * f), white);
+      gfx->fillCircle(P(32), Q(32), (int)(7 * f), c565v(lerpCol(t, b, 0.5f)));
+      break;
+    }
+  }
+}
+
+// =====================================================
+// UI PRIMITIVES
+void drawBack(uint16_t col) {
+  for (int o = 0; o < 3; o++) {
+    gfx->drawLine(24 + o, 14, 15 + o, 25, col);
+    gfx->drawLine(15 + o, 25, 24 + o, 36, col);
+  }
+  gfx->setTextDatum(lgfx::middle_left);
+  gfx->setTextColor(col);
+  gfx->drawString("Back", 32, 25, 2);
+}
+
+void drawHeader(const char* title) {
+  gfx->fillRect(0, 0, 320, 50, statusBarColor);
+  gfx->drawFastHLine(0, 49, 320, sepColor);
+  gfx->setTextDatum(lgfx::middle_center);
+  gfx->setTextColor(textColor);
+  gfx->drawString(title, 160, 25, 4);
+  drawBack(accentColor);
+}
+
+void drawToggle(int x, int y, bool on) {
+  gfx->fillRoundRect(x, y, 50, 26, 13, on ? greenColor : c565(170, 170, 175));
+  gfx->fillCircle(on ? x + 37 : x + 13, y + 13, 10, c565(255, 255, 255));
+}
+
+void drawBadge(int kind, int x, int y) {
+  Col cols[8] = {{88, 86, 214}, {255, 149, 0}, {10, 132, 255}, {10, 132, 255}, {142, 142, 147}, {52, 199, 89}, {255, 59, 48}, {52, 120, 246}};
+  uint16_t w = c565(255, 255, 255);
+  uint16_t base = c565v(cols[kind]);
+  gfx->fillRoundRect(x, y, 30, 30, 8, base);
+  int cx = x + 15, cy = y + 15;
+  switch (kind) {
+    case 0:
+      gfx->fillCircle(cx, cy, 8, w);
+      gfx->fillCircle(cx + 4, cy - 3, 7, base);
+      break;
+    case 1:
+      gfx->fillTriangle(cx - 10, cy + 8, cx - 3, cy - 6, cx + 4, cy + 8, w);
+      gfx->fillTriangle(cx - 2, cy + 8, cx + 4, cy - 1, cx + 10, cy + 8, w);
+      gfx->fillCircle(cx + 6, cy - 6, 2, w);
+      break;
+    case 2:
+      for (int i = 0; i < 4; i++) {
+        int bh = 3 + i * 3;
+        gfx->fillRect(cx - 9 + i * 5, cy + 8 - bh, 3, bh, w);
+      }
+      break;
+    case 4:
+      gfx->fillRoundRect(cx - 7, cy - 1, 14, 10, 2, w);
+      gfx->drawRoundRect(cx - 5, cy - 9, 10, 12, 5, w);
+      break;
+    case 5:
+      gfx->setTextDatum(lgfx::middle_center);
+      gfx->setTextColor(w);
+      gfx->drawString("C", cx, cy, 2);
+      break;
+    case 7:  // download arrow
+      gfx->fillRect(cx - 2, cy - 9, 5, 10, w);
+      gfx->fillTriangle(cx - 8, cy, cx + 8, cy, cx, cy + 9, w);
+      break;
+    default:
+      gfx->fillCircle(cx, cy - 3, 7, w);
+      gfx->fillTriangle(cx - 6, cy, cx + 6, cy, cx, cy + 10, w);
+      gfx->fillCircle(cx, cy - 3, 3, base);
+      break;
+  }
+}
+
+void drawRowBase(int y, const char* label, int badge) {
+  gfx->fillRoundRect(10, y, 300, 42, 12, cardColor);
+  drawBadge(badge, 18, y + 6);
+  gfx->setTextDatum(lgfx::middle_left);
+  gfx->setTextColor(textColor);
+  gfx->drawString(label, 58, y + 21, 2);
+}
+
+void drawRowValue(int y, const String &v) {
+  gfx->setTextDatum(lgfx::middle_right);
+  gfx->setTextColor(subColor);
+  gfx->drawString(v, 282, y + 21, 2);
+  gfx->setTextDatum(lgfx::middle_center);
+  gfx->drawString(">", 296, y + 21, 2);
+}
+
+void drawBars(int x, int y, int level, uint16_t on, uint16_t off) {
+  for (int i = 0; i < 4; i++) {
+    int bh = 3 + i * 3;
+    gfx->fillRect(x + i * 5, y + 12 - bh, 3, bh, i < level ? on : off);
+  }
+}
+
+int rssiLevel(int r) { return r > -55 ? 4 : r > -65 ? 3 : r > -75 ? 2 : r > -85 ? 1 : 0; }
+
+void keyFace(int x, int y, int w, int h, const char* label, uint16_t face, uint16_t txt, int font) {
+  gfx->fillRoundRect(x, y + 1, w, h, 6, keyShadowColor);
+  gfx->fillRoundRect(x, y, w, h, 6, face);
+  gfx->setTextDatum(lgfx::middle_center);
+  gfx->setTextColor(txt);
+  gfx->drawString(label, x + w / 2, y + h / 2, font);
+}
+
+void flashKey(int x, int y, int w, int h, const char* label, uint16_t face, uint16_t txt, int font) {
+  lgfx::LGFXBase* save = gfx;
+  gfx = &tft;
+  keyFace(x, y, w, h, label, accentColor, c565(255, 255, 255), font);
+  delay(30);
+  keyFace(x, y, w, h, label, face, txt, font);
+  gfx = save;
+}
+
+// =====================================================
+// TIME HELPERS
+void syncTime() { configTzTime(TIME_ZONE, "pool.ntp.org", "time.nist.gov"); }
+
+String fmtTime12(const struct tm &ti, String &ap) {
+  int h = ti.tm_hour % 12;
+  if (h == 0) h = 12;
+  ap = (ti.tm_hour >= 12) ? "PM" : "AM";
+  char b[10];
+  snprintf(b, sizeof(b), "%d:%02d", h, ti.tm_min);
+  return String(b);
+}
+
+void drawBigClock(int ty) {
+  const char* dayNames[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+  const char* monNames[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+  uint16_t white = c565(255, 255, 255);
+  gfx->setTextDatum(lgfx::middle_center);
+  struct tm ti;
+  if (getLocalTime(&ti, 0)) {
+    String ap;
+    String t = fmtTime12(ti, ap);
+    shadowText(t, 125, ty, 7, white);
+    shadowText(ap, 272, ty + 12, 4, white);
+    shadowText(String(dayNames[ti.tm_wday]) + ", " + monNames[ti.tm_mon] + " " + String(ti.tm_mday), 160, ty + 48, 4, white);
+  } else {
+    shadowText("--:--", 160, ty, 7, white);
+    shadowText(wifiConnected ? "Setting time..." : "Connect WiFi to set time", 160, ty + 48, 2, white);
+  }
+}
+
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  tft.init();
+  tft.setRotation(0);
+  tft.fillScreen(0);
+  tft.setBrightness(0);
+  ft6336u.begin();
+
+  preferences.begin("settings", false);
+  loadSettings();
+  applyTheme();
+
+  // API key: a real key in the code gets saved on the phone; otherwise use the saved one
+  if (!openRouterKey.startsWith("PASTE") && openRouterKey.length() > 10) {
+    if (preferences.getString("orkey", "") != openRouterKey) preferences.putString("orkey", openRouterKey);
+  } else {
+    openRouterKey = preferences.getString("orkey", "");
+  }
+
+  if (psramFound()) {
+    spr.setColorDepth(16);
+    spr.setPsram(true);
+    haveSpr = (spr.createSprite(320, 480) != nullptr);
+  }
+  Serial.println(haveSpr ? "Smooth mode: ON" : "Smooth mode: OFF (enable PSRAM in the Tools menu)");
+
+  // Splash + fade in
+  beginFull();
+  drawWallpaper(wallIdx, 0, 0, 320, 480);
+  gfx->setTextDatum(lgfx::middle_center);
+  shadowText("ESP32 Phone", 160, 225, 4, c565(255, 255, 255));
+  shadowText("Starting...", 160, 258, 2, c565(255, 255, 255));
+  endFull(0);
+  for (int b = 0; b <= brightness; b += 12) {
+    tft.setBrightness(b);
+    delay(14);
+  }
+  setBrightness(brightness);
+
+  tryAutoConnect();
+  syncTime();
+  if (wifiConnected) {
+    wxDownload();
+    updCheck();          // quiet check: Settings shows "Available" if there is an update
+    updState = U_IDLE;
+  }
+
+  if (lockPin.length() > 0) {
+    currentScreen = LOCK;
+    drawLockScreen(3);
+  } else {
+    currentScreen = HOME;
+    drawHomeScreen(3);
+  }
+}
+
+// =====================================================
+void applySliderTouch(int tx) {
+  brightness = constrain(map(tx, 40, 280, 30, 255), 30, 255);
+  setBrightness(brightness);
+  drawBrightnessSlider();
+}
+
+void goBack() {
+  switch (currentScreen) {
+    case WIFI_LIST:
+    case WALL_PICK:
+      if (fromHome) {
+        fromHome = false;
+        currentScreen = HOME;
+        drawHomeScreen(2);
+      } else {
+        currentScreen = SETTINGS;
+        drawSettingsScreen(2);
+      }
+      break;
+    case PIN_SET:
+    case LOC_SEARCH:
+    case UPDATE:
+      currentScreen = SETTINGS;
+      drawSettingsScreen(2);
+      break;
+    case WIFI_PASSWORD:
+      currentScreen = WIFI_LIST;
+      drawWifiList(2);
+      break;
+    case LOC_LIST:
+      currentScreen = LOC_SEARCH;
+      drawLocSearch(2);
+      break;
+    case NOTE_EDIT:
+      finishNote();
+      currentScreen = NOTES_LIST;
+      drawNotesList(2);
+      break;
+    default:
+      currentScreen = HOME;
+      showAIKeyboard = false;
+      drawHomeScreen(2);
+      break;
+  }
+}
+
+// app ids: 0 weather, 1 AI, 2 snake, 3 settings, 4 calculator, 5 wifi, 6 wallpaper, 8 notes, 9 clock
+void openApp(int i) {
+  if (i == 0) {
+    currentScreen = WEATHER;
+    fetchWeather(3);
+  } else if (i == 1) {
+    currentScreen = AI_CHAT;
+    showAIKeyboard = false;
+    drawAIChat(3);
+  } else if (i == 2) {
+    currentScreen = GAME;
+    snakeNewGame(false);
+  } else if (i == 4) {
+    currentScreen = CALC;
+    drawCalc(3);
+  } else if (i == 5) {
+    fromHome = true;
+    currentScreen = WIFI_LIST;
+    wifiScanning = true;
+    networkCount = 0;
+    drawWifiList(3);
+    scanWiFi();
+    wifiScanning = false;
+    drawWifiList(0);
+  } else if (i == 6) {
+    fromHome = true;
+    currentScreen = WALL_PICK;
+    drawWallPicker(3);
+  } else if (i == 8) {
+    currentScreen = NOTES_LIST;
+    drawNotesList(3);
+  } else if (i == 9) {
+    clockTab = 0;
+    clkLastSec = -1;
+    clkLastMin = -1;
+    currentScreen = CLOCK;
+    drawClock(3);
+  } else {
+    currentScreen = SETTINGS;
+    drawSettingsScreen(3);
+  }
+}
+
+// =====================================================
+void loop() {
+  FT6336U_TouchPointType tp = ft6336u.scan();
+
+  if (tp.touch_count > 0) {
+    int tx = tp.tp[0].x;
+    int ty = tp.tp[0].y;
+
+    if (touching && sliderDrag && currentScreen == SETTINGS) applySliderTouch(tx);
+    if (touching && currentScreen == GAME && snState == SN_PLAY) snakeSwipe(tx, ty);
+
+    if (!touching) {
+      touching = true;
+      touchStartY = ty;
+      touchLastY = ty;
+
+      bool hasBack = (currentScreen != HOME && currentScreen != LOCK && currentScreen != GAME);
+
+      if (hasBack && tx < 90 && ty < 50) {
+        goBack();
+      } else if (currentScreen == LOCK) {
+        handleLockTouch(tx, ty);
+      } else if (currentScreen == PIN_SET) {
+        handlePinSetTouch(tx, ty);
+      } else if (currentScreen == GAME) {
+        if (tx < 90 && ty < 50) {
+          goBack();
+        } else {
+          snSwipeX = tx;
+          snSwipeY = ty;
+          snakeTap();
+        }
+      } else if (currentScreen == HOME) {
+        if (lockPin.length() > 0 && tx > 125 && tx < 195 && ty < 30) {
+          lockNow();
+        } else if (ty >= 130 && ty < 192) {
+          openApp(0);                                   // weather widget
+        } else if (ty >= 200 && ty < 380) {
+          int col = tx / 80;
+          int row = -1;
+          if (ty < 288) row = 0;
+          else if (ty >= 296) row = 1;
+          if (row >= 0 && col >= 0 && col < 4) {
+            int id = HOME_GRID[row * 4 + col];
+            if (id >= 0) openApp(id);
+          }
+        } else if (ty >= 384 && ty < 470) {
+          int i = (tx - 14) / 72;
+          if (tx >= 14 && i >= 0 && i < 4) openApp(HOME_DOCK[i]);
+        }
+      } else if (currentScreen == SETTINGS) {
+        if (ty > 78 && ty < 118) {
+          sliderDrag = true;
+          applySliderTouch(tx);
+        } else if (ty >= 120 && ty < 162) {
+          darkTheme = !darkTheme;
+          applyTheme();
+          saveSettings();
+          drawSettingsScreen(0);
+        } else if (ty >= 168 && ty < 210) {
+          fromHome = false;
+          currentScreen = WALL_PICK;
+          drawWallPicker(1);
+        } else if (ty >= 216 && ty < 258) {
+          fromHome = false;
+          currentScreen = WIFI_LIST;
+          wifiScanning = true;
+          networkCount = 0;
+          drawWifiList(1);
+          scanWiFi();
+          wifiScanning = false;
+          drawWifiList(0);
+        } else if (ty >= 264 && ty < 306) {
+          newPin = "";
+          pinSetMsg = "";
+          currentScreen = PIN_SET;
+          drawPinSet(1);
+        } else if (ty >= 312 && ty < 354) {
+          useMetric = !useMetric;
+          saveSettings();
+          drawSettingsScreen(0);
+        } else if (ty >= 360 && ty < 402) {
+          locInput = "";
+          locShift = false;
+          locMsg = "";
+          currentScreen = LOC_SEARCH;
+          drawLocSearch(1);
+        } else if (ty >= 408 && ty < 450) {
+          openUpdate();
+        }
+      } else if (currentScreen == UPDATE) {
+        handleUpdateTouch(tx, ty);
+      } else if (currentScreen == WALL_PICK) {
+        if (tx >= 8 && ty >= 64) {
+          int c = (tx - 8) / 104, r = (ty - 64) / 174;
+          if (c < 3 && r < 2 && ((tx - 8) % 104) < 96 && ((ty - 64) % 174) < 150) {
+            wallIdx = r * 3 + c;
+            preferences.putInt("wall", wallIdx);
+            drawWallPicker(0);
+          }
+        }
+      } else if (currentScreen == WIFI_LIST) {
+        for (int i = 0; i < networkCount && i < 8; i++) {
+          int itemY = 62 + i * 50;
+          if (ty > itemY && ty < itemY + 44) {
+            selectedNetwork = i;
+            passwordInput = "";
+            keyboardShift = false;
+            currentScreen = WIFI_PASSWORD;
+            drawPasswordScreen(1);
+            break;
+          }
+        }
+      } else if (currentScreen == WIFI_PASSWORD) {
+        handlePasswordTouch(tx, ty);
+      } else if (currentScreen == AI_CHAT) {
+        handleAITouch(tx, ty);
+      } else if (currentScreen == CALC) {
+        handleCalcTouch(tx, ty);
+      } else if (currentScreen == NOTES_LIST) {
+        handleNotesListTouch(tx, ty);
+      } else if (currentScreen == NOTE_EDIT) {
+        handleNoteEditTouch(tx, ty);
+      } else if (currentScreen == CLOCK) {
+        handleClockTouch(tx, ty);
+      } else if (currentScreen == WEATHER) {
+        if (tx > 230 && ty < 50) fetchWeather(0);
+      } else if (currentScreen == LOC_SEARCH) {
+        handleLocSearchTouch(tx, ty);
+      } else if (currentScreen == LOC_LIST) {
+        handleLocListTouch(tx, ty);
+      }
+    }
+    touchLastY = ty;
+  } else {
+    if (sliderDrag) {
+      sliderDrag = false;
+      saveSettings();
+    }
+    if (touching && currentScreen != LOCK && currentScreen != HOME && touchStartY > 420 && touchLastY < touchStartY - 60) {
+      if (currentScreen == NOTE_EDIT) finishNote();
+      fromHome = false;
+      currentScreen = HOME;
+      showAIKeyboard = false;
+      drawHomeScreen(2);
+    }
+    touching = false;
+    touchStartY = -1;
+    touchLastY = -1;
+  }
+
+  // Timer finished? (waits while on the lock screen or in the game)
+  if (timerRunning && (long)(millis() - timerEndMs) >= 0 && currentScreen != LOCK && currentScreen != GAME) {
+    timerRunning = false;
+    timerRemainMs = 0;
+    timerDone = true;
+    timerDoneAt = millis();
+    timerFlash = true;
+    timerLastFlash = millis();
+    lastTimerSec = -1;
+    if (currentScreen == NOTE_EDIT) finishNote();
+    clockTab = 1;
+    currentScreen = CLOCK;
+    drawClock(3);
+  }
+
+  static unsigned long lastClockCheck = 0;
+  static int lastMin = -1;
+  if (millis() - lastClockCheck > 1000) {
+    lastClockCheck = millis();
+    if (currentScreen == HOME || currentScreen == LOCK) {
+      struct tm ti;
+      int m = getLocalTime(&ti, 0) ? ti.tm_min : -2;
+      if (m != lastMin) {
+        lastMin = m;
+        if (currentScreen == HOME) drawHomeScreen(0);
+        else drawLockScreen(0);
+      }
+    }
+  }
+
+  static unsigned long lastClkTick = 0;
+  if (currentScreen == CLOCK && millis() - lastClkTick >= 100) {
+    lastClkTick = millis();
+    clockTick();
+  }
+
+  if (currentScreen == GAME) {
+    snakeStep();
+    delay(4);
+  } else {
+    delay(8);
+  }
+}
+
+// =====================================================
+// HOME
+void drawHomeScreen(int anim) {
+  beginFull();
+  uint16_t white = c565(255, 255, 255);
+  drawWallpaper(wallIdx, 0, 0, 320, 480);
+
+  // status row
+  int lvl = 0;
+  if (wifiConnected) lvl = rssiLevel(WiFi.RSSI());
+  drawBars(10, 8, lvl, white, c565(170, 170, 190));
+  if (lockPin.length() > 0) {
+    gfx->fillRoundRect(130, 4, 60, 22, 11, glassAt(15, 0.30f));
+    gfx->setTextDatum(lgfx::middle_center);
+    shadowText("Lock", 160, 15, 2, white);
+  }
+  if (wifiConnected) {
+    String s = wifiSSID;
+    if (s.length() > 12) s = s.substring(0, 11) + "..";
+    gfx->setTextDatum(lgfx::middle_right);
+    shadowText(s, 312, 15, 1, white);
+  }
+
+  drawBigClock(62);
+
+  // weather widget (compact)
+  gfx->fillRoundRect(16, 130, 288, 60, 16, glassAt(160, 0.22f));
+  if (wxValid) {
+    drawWxIcon(wxCode, 60, 160, 44);
+    gfx->setTextDatum(lgfx::middle_left);
+    shadowText(String((int)lroundf(wxTemp)) + (useMetric ? " C" : " F"), 96, 144, 4, white);
+    shadowText(wxShort(wxCode), 96, 164, 2, white);
+    shadowText(wxPlace, 96, 181, 1, white);
+  } else {
+    drawWxIcon(0, 60, 160, 44);
+    gfx->setTextDatum(lgfx::middle_left);
+    shadowText("Tap for weather", 96, 160, 2, white);
+  }
+
+  // app grid: 2 rows x 4 columns
+  for (int row = 0; row < 2; row++) {
+    for (int col = 0; col < 4; col++) {
+      int id = HOME_GRID[row * 4 + col];
+      if (id < 0) continue;
+      int ix = col * 80 + 12;
+      int iy = 204 + row * 92;
+      drawAppIcon(id, ix, iy, 56);
+      gfx->setTextDatum(lgfx::middle_center);
+      shadowText(APP_NAMES[id], col * 80 + 40, iy + 68, 1, white);
+    }
+  }
+
+  // dock (4 apps)
+  gfx->fillRoundRect(10, 384, 300, 84, 24, glassAt(426, 0.18f));
+  gfx->drawRoundRect(10, 384, 300, 84, 24, glassAt(426, 0.38f));
+  for (int i = 0; i < 4; i++) {
+    drawAppIcon(HOME_DOCK[i], 22 + i * 72, 398, 56);
+  }
+
+  // red dot on Settings when an update is available
+  if (updAvail) {
+    gfx->fillCircle(22 + 3 * 72 + 52, 402, 7, redColor);
+  }
+  endFull(anim);
+}
+
+// =====================================================
+// LOCK SCREEN
+void lockNow() {
+  pinEntry = "";
+  lockMsg = "";
+  showAIKeyboard = false;
+  currentScreen = LOCK;
+  drawLockScreen(3);
+}
+
+int keypadIdx(int tx, int ty) {
+  if (ty < 215 || ty >= 443 || tx < 10 || tx >= 310) return -1;
+  int col = (tx - 10) / 100;
+  int row = (ty - 215) / 58;
+  if (col > 2 || row > 3) return -1;
+  return row * 3 + col;
+}
+
+void drawPadKey(int idx, bool glass, bool pressed) {
+  const char* keys = "123456789C0<";
+  char k = keys[idx];
+  int x = 15 + (idx % 3) * 100, y = 215 + (idx / 3) * 58;
+  const char* word = (k == 'C') ? "Clear" : (k == '<') ? "Del" : nullptr;
+  char b[2] = {k, 0};
+  uint16_t white = c565(255, 255, 255);
+  if (glass) {
+    gfx->fillRoundRect(x, y, 90, 48, 24, pressed ? glassAt(y + 24, 0.55f) : glassAt(y + 24, 0.26f));
+    gfx->setTextDatum(lgfx::middle_center);
+    gfx->setTextColor(white);
+    gfx->drawString(word ? word : b, x + 45, y + 24, word ? 2 : 4);
+  } else {
+    uint16_t face = pressed ? accentColor : (word ? keySpecialColor : keyFaceColor);
+    keyFace(x, y, 90, 48, word ? word : b, face, pressed ? white : textColor, word ? 2 : 4);
+  }
+}
+
+void drawKeypad(bool glass) {
+  for (int i = 0; i < 12; i++) drawPadKey(i, glass, false);
+}
+
+void drawLockScreen(int anim) {
+  beginFull();
+  uint16_t white = c565(255, 255, 255);
+  drawWallpaper(wallIdx, 0, 0, 320, 480);
+  drawBigClock(64);
+
+  int n = lockPin.length();
+  if (n < 1) n = 4;
+  int startX = 160 - (n - 1) * 12;
+  for (int i = 0; i < n; i++) {
+    int cx = startX + i * 24;
+    if (i < (int)pinEntry.length()) gfx->fillCircle(cx, 172, 7, white);
+    else gfx->drawCircle(cx, 172, 7, white);
+  }
+  gfx->setTextDatum(lgfx::top_center);
+  shadowText(lockMsg.length() ? lockMsg : String("Enter PIN"), 160, 187, 2, lockMsg.length() ? c565(255, 140, 140) : white);
+  drawKeypad(true);
+  endFull(anim);
+}
+
+void handleLockTouch(int tx, int ty) {
+  int idx = keypadIdx(tx, ty);
+  if (idx < 0) return;
+  char k = "123456789C0<"[idx];
+  drawPadKey(idx, true, true);
+  lockMsg = "";
+  if (k == 'C') pinEntry = "";
+  else if (k == '<') {
+    if (pinEntry.length() > 0) pinEntry.remove(pinEntry.length() - 1);
+  } else if ((int)pinEntry.length() < (int)lockPin.length()) pinEntry += k;
+
+  if (pinEntry.length() == lockPin.length()) {
+    if (pinEntry == lockPin) {
+      pinEntry = "";
+      currentScreen = HOME;
+      drawHomeScreen(3);
+      return;
+    }
+    lockMsg = "Wrong PIN";
+    pinEntry = "";
+    drawLockScreen(0);
+    delay(250);
+    return;
+  }
+  drawLockScreen(0);
+}
+
+// =====================================================
+// CHANGE PIN
+void drawPinSet(int anim) {
+  beginFull();
+  gfx->fillScreen(bgColor);
+  drawHeader("Lock PIN");
+  gfx->setTextDatum(lgfx::top_center);
+  gfx->setTextColor(textColor);
+  gfx->drawString("Enter new PIN (4-8 digits)", 160, 60, 2);
+  gfx->setTextColor(subColor);
+  gfx->drawString("Empty + Save = lock off", 160, 82, 2);
+  gfx->fillRoundRect(60, 110, 200, 44, 12, cardColor);
+  gfx->drawRoundRect(60, 110, 200, 44, 12, sepColor);
+  gfx->setTextDatum(lgfx::middle_center);
+  gfx->setTextColor(textColor);
+  gfx->drawString(newPin.length() ? newPin : String("----"), 160, 132, 4);
+  if (pinSetMsg.length()) {
+    gfx->setTextDatum(lgfx::top_center);
+    gfx->setTextColor(redColor);
+    gfx->drawString(pinSetMsg, 160, 164, 2);
+  }
+  drawKeypad(false);
+  gfx->fillRoundRect(40, 444, 240, 32, 12, accentColor);
+  gfx->setTextDatum(lgfx::middle_center);
+  gfx->setTextColor(c565(255, 255, 255));
+  gfx->drawString("Save", 160, 460, 2);
+  endFull(anim);
+}
+
+void handlePinSetTouch(int tx, int ty) {
+  if (ty >= 444 && ty < 478) {
+    if (newPin.length() == 0 || (newPin.length() >= 4 && newPin.length() <= 8)) {
+      lockPin = newPin;
+      preferences.putString("pin", lockPin);
+      currentScreen = SETTINGS;
+      drawSettingsScreen(2);
+    } else {
+      pinSetMsg = "PIN must be 4-8 digits";
+      drawPinSet(0);
+    }
+    return;
+  }
+  int idx = keypadIdx(tx, ty);
+  if (idx < 0) return;
+  char k = "123456789C0<"[idx];
+  drawPadKey(idx, false, true);
+  pinSetMsg = "";
+  if (k == 'C') newPin = "";
+  else if (k == '<') {
+    if (newPin.length() > 0) newPin.remove(newPin.length() - 1);
+  } else if (newPin.length() < 8) newPin += k;
+  drawPinSet(0);
+}
+
+// =====================================================
+// KEYBOARD
+void drawGoodKeyboard(bool shiftState) {
+  const char* rows[] = {"1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"};
+  gfx->fillRect(0, 218, 320, 262, keyBgColor);
+  for (int r = 0; r < 3; r++) {
+    for (int c = 0; c < 10; c++) {
+      int x = 5 + c * 32, y = 230 + r * 40;
+      if (r == 2 && c == 9) {
+        keyFace(293, y, 24, 36, "<-", keySpecialColor, textColor, 1);
+      } else {
+        char b[2] = {rows[r][c], 0};
+        if (r > 0 && shiftState) b[0] = toupper(b[0]);
+        keyFace(x, y, 29, 36, b, keyFaceColor, textColor, 2);
+      }
+    }
+  }
+  for (int c = 0; c < 7; c++) {
+    char b[2] = {rows[3][c], 0};
+    if (shiftState) b[0] = toupper(b[0]);
+    keyFace(5 + c * 32, 350, 29, 36, b, keyFaceColor, textColor, 2);
+  }
+  keyFace(229, 350, 86, 36, "Space", keyFaceColor, textColor, 2);
+  keyFace(5, 390, 90, 35, "SHIFT", shiftState ? accentColor : keySpecialColor, shiftState ? c565(255, 255, 255) : textColor, 2);
+
+  const char* label = "Send";
+  if (currentScreen == WIFI_PASSWORD) label = "Connect";
+  else if (currentScreen == LOC_SEARCH) label = "Search";
+  else if (currentScreen == NOTE_EDIT) label = "Done";
+  keyFace(40, 430, 240, 40, label, accentColor, c565(255, 255, 255), 2);
+}
+
+void updateInputField(const String& text) {
+  gfx->fillRoundRect(20, 100, 280, 40, 12, cardColor);
+  gfx->drawRoundRect(20, 100, 280, 40, 12, sepColor);
+  gfx->setTextDatum(lgfx::middle_left);
+  gfx->setTextColor(textColor);
+  String d = text;
+  if (d.length() > 20) d = ".." + d.substring(d.length() - 18);
+  d += "|";
+  gfx->drawString(d, 34, 120, 2);
+}
+
+void updateAIInputField() {
+  gfx->fillRoundRect(15, 174, 290, 38, 14, cardColor);
+  gfx->drawRoundRect(15, 174, 290, 38, 14, sepColor);
+  gfx->setTextDatum(lgfx::middle_left);
+  String d = aiInput;
+  if (d.length() > 24) d = ".." + d.substring(d.length() - 22);
+  if (d.length() == 0) {
+    gfx->setTextColor(subColor);
+    gfx->drawString("Type a message...", 28, 193, 2);
+  } else {
+    gfx->setTextColor(textColor);
+    gfx->drawString(d + "|", 28, 193, 2);
+  }
+}
+
+bool handleKeyboardKey(int tx, int ty, String &buf, bool &shift) {
+  const char* rows[3] = {"1234567890", "qwertyuiop", "asdfghjkl"};
+  int idx = (tx - 5) / 32;
+  if (idx < 0) idx = 0;
+  if (ty >= 230 && ty < 350) {
+    int r = (ty - 230) / 40;
+    int y = 230 + r * 40;
+    if (r == 2 && tx >= 293) {
+      flashKey(293, y, 24, 36, "<-", keySpecialColor, textColor, 1);
+      if (buf.length() > 0) buf.remove(buf.length() - 1);
+      return true;
+    }
+    int maxIdx = (r == 2) ? 9 : 10;
+    if (idx >= maxIdx) return false;
+    char k = rows[r][idx];
+    if (r > 0 && shift) k = toupper(k);
+    char b[2] = {k, 0};
+    flashKey(5 + idx * 32, y, 29, 36, b, keyFaceColor, textColor, 2);
+    buf += k;
+    return true;
+  } else if (ty >= 350 && ty < 390) {
+    if (tx >= 229) {
+      flashKey(229, 350, 86, 36, "Space", keyFaceColor, textColor, 2);
+      buf += " ";
+      return true;
+    }
+    if (idx >= 7) return false;
+    char k = "zxcvbnm"[idx];
+    if (shift) k = toupper(k);
+    char b[2] = {k, 0};
+    flashKey(5 + idx * 32, 350, 29, 36, b, keyFaceColor, textColor, 2);
+    buf += k;
+    return true;
+  } else if (ty >= 390 && ty < 428 && tx >= 5 && tx <= 95) {
+    shift = !shift;
+    drawGoodKeyboard(shift);
+    return false;
+  }
+  return false;
+}
+
+// =====================================================
+// WIFI
+void drawWifiList(int anim) {
+  beginFull();
+  gfx->fillScreen(bgColor);
+  drawHeader("WiFi");
+  gfx->setTextDatum(lgfx::middle_center);
+  gfx->setTextColor(subColor);
+  if (wifiScanning) gfx->drawString("Scanning...", 160, 240, 4);
+  else if (networkCount == 0) gfx->drawString("No networks found", 160, 240, 2);
+  for (int i = 0; i < networkCount && i < 8; i++) {
+    int y = 62 + i * 50;
+    bool conn = wifiConnected && networks[i] == wifiSSID;
+    gfx->fillRoundRect(12, y, 296, 44, 12, cardColor);
+    String s = networks[i];
+    if (s.length() > 20) s = s.substring(0, 19) + "..";
+    gfx->setTextDatum(lgfx::middle_left);
+    gfx->setTextColor(textColor);
+    gfx->drawString(s, 26, conn ? y + 15 : y + 22, 2);
+    if (conn) {
+      gfx->setTextColor(accentColor);
+      gfx->drawString("Connected", 26, y + 33, 1);
+    }
+    drawBars(280, y + 15, rssiLevel(networkRssi[i]), textColor, sepColor);
+    if (networkSecure[i]) {
+      gfx->fillRoundRect(258, y + 22, 10, 8, 2, subColor);
+      gfx->drawRoundRect(260, y + 15, 6, 9, 3, subColor);
+    }
+  }
+  endFull(anim);
+}
+
+void drawPasswordScreen(int anim) {
+  beginFull();
+  gfx->fillScreen(bgColor);
+  drawHeader("Password");
+  gfx->setTextDatum(lgfx::top_center);
+  gfx->setTextColor(subColor);
+  if (selectedNetwork >= 0) gfx->drawString(networks[selectedNetwork], 160, 66, 2);
+  updateInputField(passwordInput);
+  drawGoodKeyboard(keyboardShift);
+  endFull(anim);
+}
+
+void handlePasswordTouch(int tx, int ty) {
+  if (ty >= 430 && ty < 475) {
+    if (selectedNetwork >= 0) {
+      wifiSSID = networks[selectedNetwork];
+      wifiPASS = passwordInput;
+      preferences.putString("ssid", wifiSSID);
+      preferences.putString("pass", wifiPASS);
+      gfx = &tft;
+      tft.fillRoundRect(40, 430, 240, 40, 6, accentColor);
+      tft.setTextDatum(lgfx::middle_center);
+      tft.setTextColor(c565(255, 255, 255));
+      tft.drawString("Connecting...", 160, 450, 2);
+      connectWiFi();
+      if (fromHome) {
+        fromHome = false;
+        currentScreen = HOME;
+        drawHomeScreen(2);
+      } else {
+        currentScreen = SETTINGS;
+        drawSettingsScreen(2);
+      }
+    }
+  } else if (handleKeyboardKey(tx, ty, passwordInput, keyboardShift)) {
+    updateInputField(passwordInput);
+  }
+  delay(40);
+}
+
+// =====================================================
+// WALLPAPER PICKER
+void drawWallPicker(int anim) {
+  beginFull();
+  gfx->fillScreen(bgColor);
+  drawHeader("Wallpaper");
+  for (int i = 0; i < WALL_COUNT; i++) {
+    int c = i % 3, r = i / 3;
+    int x = 8 + c * 104, y = 64 + r * 174;
+    drawWallpaper(i, x, y, 96, 144);
+    if (i == wallIdx) {
+      gfx->drawRoundRect(x - 3, y - 3, 102, 150, 6, accentColor);
+      gfx->drawRoundRect(x - 4, y - 4, 104, 152, 7, accentColor);
+    }
+    gfx->setTextDatum(lgfx::middle_center);
+    gfx->setTextColor(textColor);
+    gfx->drawString(WALLS[i].name, x + 48, y + 160, 2);
+  }
+  gfx->setTextColor(subColor);
+  gfx->drawString("Tap a wallpaper to use it", 160, 440, 2);
+  endFull(anim);
+}
+
+// =====================================================
+// LOCATION SEARCH
+void handleLocSearchTouch(int tx, int ty) {
+  if (ty >= 430 && ty < 475) {
+    if (locInput.length() > 0) {
+      locMsg = "Searching...";
+      drawLocSearch(0);
+      if (searchLocations(locInput) && locCount > 0) {
+        currentScreen = LOC_LIST;
+        drawLocList(1);
+      } else {
+        drawLocSearch(0);
+      }
+    }
+  } else if (handleKeyboardKey(tx, ty, locInput, locShift)) {
+    updateInputField(locInput);
+  }
+  delay(40);
+}
+
+void handleLocListTouch(int tx, int ty) {
+  for (int i = 0; i < locCount && i < 8; i++) {
+    int itemY = 62 + i * 50;
+    if (ty > itemY && ty < itemY + 46) {
+      wxLat = locLat[i];
+      wxLon = locLon[i];
+      wxPlace = locName[i];
+      if (locAdmin[i].length() > 0) wxPlace += ", " + locAdmin[i];
+      saveSettings();
+      wxValid = false;
+      currentScreen = SETTINGS;
+      drawSettingsScreen(2);
+      break;
+    }
+  }
+}
+
+bool searchLocations(const String& q) {
+  locCount = 0;
+  if (!wifiConnected) { locMsg = "No WiFi connection"; return false; }
+  String name = q;
+  name.trim();
+  name.replace(" ", "%20");
+  String url = "https://geocoding-api.open-meteo.com/v1/search?name=" + name + "&count=8&language=en&format=json";
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(15000);
+  http.begin(client, url);
+  int code = http.GET();
+  bool ok = false;
+  if (code == 200) {
+    String payload = http.getString();
+    StaticJsonDocument<512> filter;
+    filter["results"][0]["name"] = true;
+    filter["results"][0]["latitude"] = true;
+    filter["results"][0]["longitude"] = true;
+    filter["results"][0]["admin1"] = true;
+    filter["results"][0]["country_code"] = true;
+    DynamicJsonDocument doc(6144);
+    DeserializationError err = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+    if (!err) {
+      JsonArray arr = doc["results"].as<JsonArray>();
+      for (JsonObject r : arr) {
+        if (locCount >= 8) break;
+        locName[locCount] = String((const char*)(r["name"] | ""));
+        locAdmin[locCount] = String((const char*)(r["admin1"] | ""));
+        locCountry[locCount] = String((const char*)(r["country_code"] | ""));
+        locLat[locCount] = r["latitude"] | 0.0f;
+        locLon[locCount] = r["longitude"] | 0.0f;
+        locCount++;
+      }
+      ok = true;
+      if (locCount == 0) locMsg = "No places found";
+    } else locMsg = "Data error";
+  } else if (code > 0) locMsg = "HTTP " + String(code);
+  else locMsg = http.errorToString(code);
+  http.end();
+  return ok;
+}
+
+void drawLocSearch(int anim) {
+  beginFull();
+  gfx->fillScreen(bgColor);
+  drawHeader("Location");
+  gfx->setTextDatum(lgfx::top_center);
+  gfx->setTextColor(subColor);
+  gfx->drawString("Type a city name, then Search", 160, 62, 2);
+  updateInputField(locInput);
+  if (locMsg.length() > 0) {
+    gfx->setTextDatum(lgfx::top_center);
+    gfx->setTextColor(redColor);
+    gfx->drawString(locMsg, 160, 152, 2);
+  }
+  drawGoodKeyboard(locShift);
+  endFull(anim);
+}
+
+void drawLocList(int anim) {
+  beginFull();
+  gfx->fillScreen(bgColor);
+  drawHeader("Select");
+  for (int i = 0; i < locCount && i < 8; i++) {
+    int y = 62 + i * 50;
+    gfx->fillRoundRect(12, y, 296, 46, 12, cardColor);
+    gfx->setTextDatum(lgfx::top_left);
+    gfx->setTextColor(textColor);
+    gfx->drawString(locName[i], 26, y + 6, 2);
+    String sub = locAdmin[i];
+    if (locCountry[i].length() > 0) sub += (sub.length() ? ", " : "") + locCountry[i];
+    gfx->setTextColor(subColor);
+    gfx->drawString(sub, 26, y + 28, 1);
+  }
+  endFull(anim);
+}
+
+// =====================================================
+// AI CHAT
+void addChat(const String& s) {
+  if (chatCount < MAX_CHAT) chatHistory[chatCount++] = s;
+  else {
+    for (int i = 1; i < MAX_CHAT; i++) chatHistory[i - 1] = chatHistory[i];
+    chatHistory[MAX_CHAT - 1] = s;
+  }
+}
+
+// conversation memory sent to the AI with every request
+void convAdd(bool user, const String &t) {
+  if (convCount >= CONV_MAX) {
+    for (int i = 1; i < CONV_MAX; i++) {
+      convText[i - 1] = convText[i];
+      convUser[i - 1] = convUser[i];
+    }
+    convCount = CONV_MAX - 1;
+  }
+  convText[convCount] = t;
+  convUser[convCount] = user;
+  convCount++;
+}
+
+void wrapText(const String &s, int maxChars, std::vector<String> &out) {
+  out.clear();
+  String line = "";
+  int i = 0, n = s.length();
+  while (i < n) {
+    int j = i;
+    while (j < n && s[j] != ' ') j++;
+    String word = s.substring(i, j);
+    while ((int)word.length() > maxChars) {
+      if (line.length()) { out.push_back(line); line = ""; }
+      out.push_back(word.substring(0, maxChars));
+      word = word.substring(maxChars);
+    }
+    if ((int)(line.length() + (line.length() ? 1 : 0) + word.length()) > maxChars) {
+      if (line.length()) out.push_back(line);
+      line = word;
+    } else {
+      if (line.length()) line += " ";
+      line += word;
+    }
+    i = j + 1;
+  }
+  if (line.length() || out.empty()) out.push_back(line);
+}
+
+void drawChatBubbles(int top, int bottom) {
+  uint16_t white = c565(255, 255, 255);
+  int areaH = bottom - top;
+  if (aiThinking) areaH -= 34;
+
+  if (chatCount == 0) {
+    drawAppIcon(1, 128, top + 40, 64);
+    gfx->setTextDatum(lgfx::middle_center);
+    gfx->setTextColor(subColor);
+    gfx->drawString("Ask me anything", 160, top + 130, 2);
+  }
+
+  std::vector<std::vector<String>> shown;  // newest first
+  std::vector<int> idxs;
+  int used = 0;
+  for (int i = chatCount - 1; i >= 0; i--) {
+    String m = chatHistory[i];
+    bool user = m.startsWith("You: ");
+    m = m.substring(user ? 5 : 4);
+    std::vector<String> lines;
+    wrapText(m, 38, lines);
+    int h = (int)lines.size() * 12 + 12 + 6;
+    if (used + h > areaH) {
+      if (shown.empty()) {
+        int maxL = (areaH - 18) / 12;
+        if (maxL < 1) maxL = 1;
+        if ((int)lines.size() > maxL) lines.resize(maxL);
+        shown.push_back(lines);
+        idxs.push_back(i);
+        used = areaH;
+      }
+      break;
+    }
+    shown.push_back(lines);
+    idxs.push_back(i);
+    used += h;
+  }
+
+  int y = top;
+  for (int k = (int)shown.size() - 1; k >= 0; k--) {
+    bool user = chatHistory[idxs[k]].startsWith("You: ");
+    std::vector<String> &lines = shown[k];
+    int maxLen = 0;
+    for (size_t j = 0; j < lines.size(); j++)
+      if ((int)lines[j].length() > maxLen) maxLen = lines[j].length();
+    int w = maxLen * 6 + 20;
+    if (w < 44) w = 44;
+    int h = (int)lines.size() * 12 + 12;
+    int x = user ? 312 - w : 8;
+    gfx->fillRoundRect(x, y, w, h, 12, user ? accentColor : bubbleAiColor);
+    gfx->setTextDatum(lgfx::top_left);
+    gfx->setTextColor(user ? white : textColor);
+    for (size_t j = 0; j < lines.size(); j++) gfx->drawString(lines[j], x + 10, y + 6 + (int)j * 12, 1);
+    y += h + 6;
+  }
+  if (aiThinking) {
+    gfx->fillRoundRect(8, y, 56, 26, 13, bubbleAiColor);
+    for (int d = 0; d < 3; d++) gfx->fillCircle(24 + d * 12, y + 13, 3, subColor);
+  }
+}
+
+void drawAIChat(int anim) {
+  beginFull();
+  gfx->fillScreen(bgColor);
+  drawHeader("AI Chat");
+  // "New" chat button (top-right)
+  gfx->setTextDatum(lgfx::middle_right);
+  gfx->setTextColor(accentColor);
+  gfx->drawString("New", 310, 25, 2);
+  drawChatBubbles(58, showAIKeyboard ? 168 : 396);
+
+  if (showAIKeyboard) {
+    updateAIInputField();
+    drawGoodKeyboard(aiKeyboardShift);
+  } else {
+    gfx->fillRect(0, 400, 320, 80, statusBarColor);
+    gfx->drawFastHLine(0, 400, 320, sepColor);
+    gfx->fillRoundRect(10, 415, 180, 40, 20, cardColor);
+    gfx->drawRoundRect(10, 415, 180, 40, 20, sepColor);
+    gfx->setTextDatum(lgfx::middle_left);
+    if (aiInput.length() == 0) {
+      gfx->setTextColor(subColor);
+      gfx->drawString("Message", 26, 435, 2);
+    } else {
+      String d = aiInput;
+      if (d.length() > 12) d = ".." + d.substring(d.length() - 10);
+      gfx->setTextColor(textColor);
+      gfx->drawString(d, 26, 435, 2);
+    }
+    uint16_t white = c565(255, 255, 255);
+    gfx->fillCircle(225, 435, 20, accentColor);
+    gfx->fillTriangle(216, 428, 236, 435, 216, 442, white);
+    gfx->fillCircle(285, 435, 20, c565(175, 82, 222));
+    gfx->fillRoundRect(280, 422, 10, 17, 5, white);
+    gfx->drawFastVLine(285, 442, 4, white);
+    gfx->drawFastHLine(280, 446, 11, white);
+  }
+  endFull(anim);
+}
+
+void handleAITouch(int tx, int ty) {
+  // "New" chat: clears the screen AND the AI's memory
+  if (tx > 240 && ty < 50) {
+    chatCount = 0;
+    convCount = 0;
+    aiInput = "";
+    drawAIChat(0);
+    return;
+  }
+  if (showAIKeyboard) {
+    if (ty >= 430 && ty < 475) {
+      if (aiInput.length() > 0) {
+        String msg = aiInput;
+        addChat("You: " + msg);
+        aiInput = "";
+        showAIKeyboard = false;
+        drawAIChat(0);
+        sendToAI(msg);
+      }
+    } else if (handleKeyboardKey(tx, ty, aiInput, aiKeyboardShift)) {
+      updateAIInputField();
+    }
+    delay(40);
+    return;
+  }
+  if (ty > 400 && ty < 470 && tx < 200) {
+    showAIKeyboard = true;
+    drawAIChat(0);
+  } else if (tx > 200 && tx <= 250 && ty > 400 && ty < 470) {
+    if (aiInput.length() > 0) {
+      String msg = aiInput;
+      addChat("You: " + msg);
+      aiInput = "";
+      drawAIChat(0);
+      sendToAI(msg);
+    }
+  } else if (tx > 260 && ty > 400 && ty < 470) {
+    addChat("You: [Mic - coming soon]");
+    drawAIChat(0);
+  }
+}
+
+void sendToAI(String message) {
+  if (!wifiConnected) { addChat("AI: No WiFi connection"); drawAIChat(0); return; }
+  if (openRouterKey.length() < 10 || openRouterKey.startsWith("PASTE")) { addChat("AI: No API key set"); drawAIChat(0); return; }
+
+  convAdd(true, message);   // remember what you said
+  aiThinking = true;
+  drawAIChat(0);
+
+  String body;
+  {
+    DynamicJsonDocument req(8192);
+    req["model"] = "openrouter/free";
+    req["max_tokens"] = 400;
+    JsonArray msgs = req.createNestedArray("messages");
+    JsonObject sys = msgs.createNestedObject();
+    sys["role"] = "system";
+    sys["content"] = "You are a helpful assistant on a small phone screen. Keep answers short and in plain text, no markdown.";
+    bool started = false;
+    for (int i = 0; i < convCount; i++) {
+      if (!started && !convUser[i]) continue;   // history must start with a user message
+      started = true;
+      JsonObject m = msgs.createNestedObject();
+      m["role"] = convUser[i] ? "user" : "assistant";
+      m["content"] = convText[i];
+    }
+    serializeJson(req, body);
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(30000);
+  http.begin(client, "https://openrouter.ai/api/v1/chat/completions");
+  http.addHeader("Authorization", "Bearer " + openRouterKey);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("HTTP-Referer", "https://esp32-phone.local");
+  http.addHeader("X-Title", "ESP32 AI");
+  int httpCode = http.POST(body);
+
+  String reply;
+  bool ok = false;
+  if (httpCode == 200) {
+    String response = http.getString();
+    StaticJsonDocument<128> filter;
+    filter["choices"][0]["message"]["content"] = true;
+    DynamicJsonDocument doc(6144);
+    DeserializationError err = deserializeJson(doc, response, DeserializationOption::Filter(filter));
+    if (!err) {
+      const char *content = doc["choices"][0]["message"]["content"];
+      if (content && strlen(content) > 0) {
+        reply = "AI: " + String(content);
+        ok = true;
+      } else reply = "AI: Empty response";
+    } else reply = "AI: JSON error";
+  } else if (httpCode > 0) reply = "AI: HTTP " + String(httpCode);
+  else reply = "AI: " + http.errorToString(httpCode);
+  http.end();
+
+  for (int i = 0; i < (int)reply.length(); i++) {
+    unsigned char ch = reply[i];
+    if (ch == '\n' || ch == '\r' || ch == '\t') reply.setCharAt(i, ' ');
+    else if (ch < 32 || ch > 126) reply.setCharAt(i, '?');
+  }
+  if (reply.length() > 400) reply = reply.substring(0, 400) + "...";
+
+  if (ok) convAdd(false, reply.substring(4));   // remember the AI's answer
+  else if (convCount > 0) convCount--;          // failed: forget the unanswered question
+
+  addChat(reply);
+  aiThinking = false;
+  drawAIChat(0);
+}
+
+// =====================================================
+// WEATHER
+const char* wxShort(int c) {
+  if (c == 0) return "Clear";
+  if (c == 1) return "Mostly clear";
+  if (c == 2) return "Partly cloudy";
+  if (c == 3) return "Overcast";
+  if (c == 45 || c == 48) return "Fog";
+  if (c >= 51 && c <= 57) return "Drizzle";
+  if (c >= 61 && c <= 67) return "Rain";
+  if (c >= 71 && c <= 77) return "Snow";
+  if (c >= 80 && c <= 82) return "Showers";
+  if (c == 85 || c == 86) return "Snow showers";
+  if (c >= 95) return "Thunderstorm";
+  return "Unknown";
+}
+
+void wxTheme(int c, Col &top, Col &bot) {
+  if (c <= 1) { top = Col{54, 130, 235}; bot = Col{132, 202, 250}; }
+  else if (c <= 3) { top = Col{100, 130, 170}; bot = Col{170, 195, 220}; }
+  else if (c == 45 || c == 48) { top = Col{120, 130, 145}; bot = Col{175, 182, 192}; }
+  else if ((c >= 71 && c <= 77) || c == 85 || c == 86) { top = Col{120, 145, 180}; bot = Col{205, 220, 238}; }
+  else if (c >= 95) { top = Col{38, 38, 68}; bot = Col{92, 84, 124}; }
+  else { top = Col{58, 76, 108}; bot = Col{110, 128, 158}; }
+}
+
+String wxDayName(const String &date) {
+  int y = date.substring(0, 4).toInt();
+  int m = date.substring(5, 7).toInt();
+  int d = date.substring(8, 10).toInt();
+  if (m < 1 || m > 12) return "---";
+  static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+  if (m < 3) y -= 1;
+  int dow = (y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7;
+  const char *names[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+  return String(names[dow]);
+}
+
+bool wxDownload() {
+  if (!wifiConnected) { wxValid = false; wxError = "No WiFi connection"; return false; }
+  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(wxLat, 4) +
+               "&longitude=" + String(wxLon, 4) +
+               "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m" +
+               "&daily=weather_code,temperature_2m_max,temperature_2m_min" +
+               "&temperature_unit=" + String(useMetric ? "celsius" : "fahrenheit") +
+               "&wind_speed_unit=" + String(useMetric ? "kmh" : "mph") +
+               "&timezone=auto&forecast_days=5";
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(15000);
+  http.begin(client, url);
+  int code = http.GET();
+  wxValid = false;
+  if (code == 200) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(6144);
+    DeserializationError err = deserializeJson(doc, payload);
+    if (!err) {
+      wxTemp = doc["current"]["temperature_2m"] | 0.0f;
+      wxFeels = doc["current"]["apparent_temperature"] | 0.0f;
+      wxHum = doc["current"]["relative_humidity_2m"] | 0;
+      wxWind = doc["current"]["wind_speed_10m"] | 0.0f;
+      wxCode = doc["current"]["weather_code"] | 0;
+      for (int i = 0; i < 5; i++) {
+        wxDate[i] = String((const char *)(doc["daily"]["time"][i] | "2000-01-01"));
+        wxDayCode[i] = doc["daily"]["weather_code"][i] | 0;
+        wxHi[i] = doc["daily"]["temperature_2m_max"][i] | 0.0f;
+        wxLo[i] = doc["daily"]["temperature_2m_min"][i] | 0.0f;
+      }
+      wxValid = true;
+    } else wxError = "Data error";
+  } else if (code > 0) wxError = "HTTP " + String(code);
+  else wxError = http.errorToString(code);
+  http.end();
+  return wxValid;
+}
+
+void fetchWeather(int anim) {
+  drawWeather(true, anim);
+  wxDownload();
+  drawWeather(false, 0);
+}
+
+void drawWeather(bool loading, int anim) {
+  beginFull();
+  uint16_t white = c565(255, 255, 255);
+  Col top, bot;
+  wxTheme(wxValid ? wxCode : 0, top, bot);
+  drawGradientV(0, 0, 320, 480, top, bot);
+  Col glassC = lerpCol(lerpCol(top, bot, 0.6f), Col{255, 255, 255}, 0.20f);
+  uint16_t glass = c565v(glassC);
+
+  drawBack(white);
+  gfx->setTextDatum(lgfx::middle_center);
+  gfx->setTextColor(white);
+  gfx->drawString("Weather", 160, 25, 4);
+  gfx->fillRoundRect(236, 12, 76, 26, 13, glass);
+  gfx->drawString("Refresh", 274, 25, 2);
+
+  gfx->setTextDatum(lgfx::top_center);
+  shadowText(wxPlace, 160, 56, 2, white);
+
+  if (loading) {
+    gfx->setTextDatum(lgfx::middle_center);
+    shadowText("Loading...", 160, 240, 4, white);
+    endFull(anim);
+    return;
+  }
+
+  String tu = useMetric ? " C" : " F";
+  String wu = useMetric ? " km/h" : " mph";
+
+  if (wxValid) {
+    drawWxIcon(wxCode, 160, 128, 110);
+    gfx->setTextDatum(lgfx::top_center);
+    gfx->setTextSize(2);
+    shadowText(String((int)lroundf(wxTemp)) + tu, 160, 178, 4, white);
+    gfx->setTextSize(1);
+    gfx->setTextDatum(lgfx::middle_center);
+    shadowText(wxShort(wxCode), 160, 262, 4, white);
+
+    const char* labels[3] = {"HUMIDITY", "WIND", "FEELS LIKE"};
+    String vals[3] = {String(wxHum) + "%", String((int)lroundf(wxWind)) + wu, String((int)lroundf(wxFeels)) + tu};
+    for (int i = 0; i < 3; i++) {
+      int x = 12 + i * 100;
+      gfx->fillRoundRect(x, 284, 94, 46, 14, glass);
+      gfx->setTextDatum(lgfx::middle_center);
+      gfx->setTextColor(c565(235, 240, 250));
+      gfx->drawString(labels[i], x + 47, 298, 1);
+      gfx->setTextColor(white);
+      gfx->drawString(vals[i], x + 47, 316, 2);
+    }
+
+    gfx->fillRoundRect(12, 338, 296, 132, 18, glass);
+    for (int i = 0; i < 5; i++) {
+      int y = 342 + i * 26;
+      gfx->setTextDatum(lgfx::middle_left);
+      gfx->setTextColor(white);
+      gfx->drawString(i == 0 ? String("Today") : wxDayName(wxDate[i]), 26, y + 12, 2);
+      drawWxIcon(wxDayCode[i], 130, y + 12, 24);
+      gfx->setTextDatum(lgfx::middle_right);
+      gfx->drawString(String((int)lroundf(wxHi[i])) + "/" + String((int)lroundf(wxLo[i])) + tu, 296, y + 12, 2);
+    }
+  } else {
+    gfx->setTextDatum(lgfx::middle_center);
+    shadowText("Couldn't load weather", 160, 220, 2, white);
+    shadowText(wxError, 160, 246, 2, white);
+  }
+  endFull(anim);
+}
+
+// =====================================================
+// SNAKE (draws straight to the screen for speed)
+uint16_t snBg(int cx, int cy) {
+  return ((cx + cy) & 1) ? c565(162, 209, 73) : c565(170, 215, 81);
+}
+
+void snCell(int cx, int cy, uint16_t col) {
+  tft.fillRect(SN_X0 + cx * SN_CELL, SN_Y0 + cy * SN_CELL, SN_CELL, SN_CELL, col);
+}
+
+void snDrawBody(int cx, int cy) {
+  snCell(cx, cy, snBg(cx, cy));
+  tft.fillRoundRect(SN_X0 + cx * SN_CELL + 1, SN_Y0 + cy * SN_CELL + 1, SN_CELL - 2, SN_CELL - 2, 6, c565(66, 115, 245));
+}
+
+void snDrawHead(int cx, int cy) {
+  snCell(cx, cy, snBg(cx, cy));
+  int px = SN_X0 + cx * SN_CELL, py = SN_Y0 + cy * SN_CELL;
+  tft.fillRoundRect(px, py, SN_CELL, SN_CELL, 8, c565(40, 85, 220));
+  int ex1, ey1, ex2, ey2;
+  if (snDx != 0) {
+    ex1 = ex2 = px + (snDx > 0 ? 13 : 7);
+    ey1 = py + 6;
+    ey2 = py + 14;
+  } else {
+    ey1 = ey2 = py + (snDy > 0 ? 13 : 7);
+    ex1 = px + 6;
+    ex2 = px + 14;
+  }
+  tft.fillCircle(ex1, ey1, 3, c565(255, 255, 255));
+  tft.fillCircle(ex2, ey2, 3, c565(255, 255, 255));
+  tft.fillCircle(ex1 + snDx, ey1 + snDy, 1, c565(0, 0, 0));
+  tft.fillCircle(ex2 + snDx, ey2 + snDy, 1, c565(0, 0, 0));
+}
+
+void snDrawFood() {
+  if (snFoodX < 0) return;
+  snCell(snFoodX, snFoodY, snBg(snFoodX, snFoodY));
+  int px = SN_X0 + snFoodX * SN_CELL, py = SN_Y0 + snFoodY * SN_CELL;
+  tft.fillCircle(px + 10, py + 11, 7, c565(230, 50, 50));
+  tft.fillCircle(px + 8, py + 9, 2, c565(255, 160, 160));
+  tft.fillRect(px + 10, py + 1, 2, 4, c565(90, 60, 30));
+  tft.fillTriangle(px + 12, py + 3, px + 17, py + 1, px + 13, py + 6, c565(60, 160, 60));
+}
+
+void snDrawHeader() {
+  gfx = &tft;
+  tft.fillRect(0, 0, 320, 50, statusBarColor);
+  tft.drawFastHLine(0, 49, 320, sepColor);
+  drawBack(accentColor);
+  tft.setTextDatum(lgfx::middle_center);
+  tft.setTextColor(textColor);
+  tft.drawString("Score " + String(snScore), 172, 25, 2);
+  tft.setTextDatum(lgfx::middle_right);
+  tft.setTextColor(subColor);
+  tft.drawString("Best " + String(snBest), 312, 25, 2);
+}
+
+void snDrawBoard() {
+  gfx = &tft;
+  for (int cy = 0; cy < SN_ROWS; cy++)
+    for (int cx = 0; cx < SN_COLS; cx++) snCell(cx, cy, snBg(cx, cy));
+  snDrawFood();
+  for (int i = snLen - 1; i >= 1; i--) snDrawBody(snX[i], snY[i]);
+  snDrawHead(snX[0], snY[0]);
+  tft.fillRect(0, SN_Y0 + SN_ROWS * SN_CELL, 320, 480 - (SN_Y0 + SN_ROWS * SN_CELL), statusBarColor);
+  tft.setTextDatum(lgfx::middle_center);
+  tft.setTextColor(textColor);
+  tft.drawString("Swipe to steer", 160, 436, 2);
+  tft.setTextColor(subColor);
+  tft.drawString("Swipe up from here to exit", 160, 460, 1);
+  snDrawHeader();
+}
+
+void snPlaceFood() {
+  for (int t = 0; t < 300; t++) {
+    int x = random(SN_COLS), y = random(SN_ROWS);
+    bool ok = true;
+    for (int i = 0; i < snLen; i++) {
+      if (snX[i] == x && snY[i] == y) { ok = false; break; }
+    }
+    if (ok) { snFoodX = x; snFoodY = y; return; }
+  }
+  for (int y = 0; y < SN_ROWS; y++) {
+    for (int x = 0; x < SN_COLS; x++) {
+      bool ok = true;
+      for (int i = 0; i < snLen; i++) {
+        if (snX[i] == x && snY[i] == y) { ok = false; break; }
+      }
+      if (ok) { snFoodX = x; snFoodY = y; return; }
+    }
+  }
+  snFoodX = -1;   // board is full
+}
+
+void snakeNewGame(bool start) {
+  snLen = 3;
+  for (int i = 0; i < 3; i++) {
+    snX[i] = 8 - i;
+    snY[i] = 9;
+  }
+  snDx = 1; snDy = 0; snNx = 1; snNy = 0;
+  snScore = 0;
+  snPlaceFood();
+  snDrawBoard();
+  snLast = millis();
+  if (start) {
+    snState = SN_PLAY;
+  } else {
+    snState = SN_READY;
+    tft.fillRoundRect(50, 170, 220, 130, 18, cardColor);
+    tft.setTextDatum(lgfx::middle_center);
+    tft.setTextColor(textColor);
+    tft.drawString("Snake", 160, 205, 4);
+    tft.setTextColor(accentColor);
+    tft.drawString("Tap to start", 160, 245, 2);
+    tft.setTextColor(subColor);
+    tft.drawString("Then swipe to steer", 160, 270, 2);
+  }
+}
+
+void snakeOver() {
+  snState = SN_DEAD;
+  snDeadAt = millis();
+  if (snScore > snBest) {
+    snBest = snScore;
+    preferences.putInt("best", snBest);
+  }
+  snDrawHeader();
+  tft.fillRoundRect(50, 170, 220, 130, 18, cardColor);
+  tft.setTextDatum(lgfx::middle_center);
+  tft.setTextColor(textColor);
+  tft.drawString("Game Over", 160, 202, 4);
+  tft.drawString("Score " + String(snScore) + "   Best " + String(snBest), 160, 240, 2);
+  tft.setTextColor(accentColor);
+  tft.drawString("Tap to play again", 160, 276, 2);
+}
+
+void snakeTap() {
+  if (snState == SN_READY) {
+    snState = SN_PLAY;
+    snDrawBoard();            // clears the start card
+    snLast = millis();
+  } else if (snState == SN_DEAD) {
+    if (millis() - snDeadAt > 500) snakeNewGame(true);
+  }
+}
+
+void snakeSwipe(int tx, int ty) {
+  int dx = tx - snSwipeX, dy = ty - snSwipeY;
+  if (abs(dx) < 18 && abs(dy) < 18) return;
+  int ndx = 0, ndy = 0;
+  if (abs(dx) > abs(dy)) ndx = (dx > 0) ? 1 : -1;
+  else ndy = (dy > 0) ? 1 : -1;
+  if (!(ndx == -snDx && ndy == -snDy)) {   // can't reverse into yourself
+    snNx = ndx;
+    snNy = ndy;
+  }
+  snSwipeX = tx;
+  snSwipeY = ty;
+}
+
+void snakeStep() {
+  if (snState != SN_PLAY) return;
+  int iv = 150 - snScore * 3;
+  if (iv < 75) iv = 75;
+  if (millis() - snLast < (unsigned long)iv) return;
+  snLast = millis();
+
+  snDx = snNx;
+  snDy = snNy;
+  int nx = snX[0] + snDx, ny = snY[0] + snDy;
+  if (nx < 0 || nx >= SN_COLS || ny < 0 || ny >= SN_ROWS) { snakeOver(); return; }
+
+  bool eat = (nx == snFoodX && ny == snFoodY);
+  int checkLen = eat ? snLen : snLen - 1;   // the tail moves away unless we grow
+  for (int i = 0; i < checkLen; i++) {
+    if (snX[i] == nx && snY[i] == ny) { snakeOver(); return; }
+  }
+
+  int tailX = snX[snLen - 1], tailY = snY[snLen - 1];
+  if (eat) snLen++;
+  memmove(&snX[1], &snX[0], snLen - 1);
+  memmove(&snY[1], &snY[0], snLen - 1);
+  snX[0] = nx;
+  snY[0] = ny;
+
+  if (!eat) snCell(tailX, tailY, snBg(tailX, tailY));
+  snDrawBody(snX[1], snY[1]);
+  snDrawHead(nx, ny);
+
+  if (eat) {
+    snScore++;
+    snDrawHeader();
+    snPlaceFood();
+    if (snFoodX < 0) { snakeOver(); return; }
+    snDrawFood();
+  }
+}
+
+// =====================================================
+// CALCULATOR
+String calcCur = "0";
+String calcExpr = "";
+double calcAcc = 0;
+char calcOp = 0;
+bool calcFresh = true;
+bool calcErr = false;
+
+const char* CALC_KEYS[5][4] = {
+  {"AC", "+/-", "%", "/"},
+  {"7", "8", "9", "*"},
+  {"4", "5", "6", "-"},
+  {"1", "2", "3", "+"},
+  {"0", "0", ".", "="}
+};
+
+String calcFmt(double v) {
+  if (isnan(v) || isinf(v)) return "Error";
+  if (v == 0) return "0";
+  char b[32];
+  snprintf(b, sizeof(b), "%.9g", v);
+  return String(b);
+}
+
+bool calcApply(double a, char o, double b, double &res) {
+  switch (o) {
+    case '+': res = a + b; return true;
+    case '-': res = a - b; return true;
+    case '*': res = a * b; return true;
+    case '/':
+      if (b == 0) return false;
+      res = a / b;
+      return true;
+  }
+  res = b;
+  return true;
+}
+
+String calcSym(char o) { return o == '*' ? String("x") : String(o); }
+
+void calcClear() {
+  calcCur = "0";
+  calcExpr = "";
+  calcAcc = 0;
+  calcOp = 0;
+  calcFresh = true;
+  calcErr = false;
+}
+
+void calcPress(const String &k) {
+  if (calcErr && k != "AC") calcClear();
+  char c = k[0];
+
+  if (k.length() == 1 && c >= '0' && c <= '9') {
+    if (calcFresh) {
+      calcCur = String(c);
+      calcFresh = false;
+    } else if (calcCur == "0") {
+      calcCur = String(c);
+    } else if (calcCur == "-0") {
+      calcCur = String("-") + c;
+    } else {
+      int digits = 0;
+      for (int i = 0; i < (int)calcCur.length(); i++)
+        if (calcCur[i] >= '0' && calcCur[i] <= '9') digits++;
+      if (digits < 9) calcCur += c;
+    }
+    if (calcOp == 0) calcExpr = "";
+  } else if (k == ".") {
+    if (calcFresh) {
+      calcCur = "0.";
+      calcFresh = false;
+    } else if (calcCur.indexOf('.') < 0) {
+      calcCur += ".";
+    }
+    if (calcOp == 0) calcExpr = "";
+  } else if (k == "AC") {
+    calcClear();
+  } else if (k == "+/-") {
+    if (calcCur != "0") {
+      if (calcCur.startsWith("-")) calcCur.remove(0, 1);
+      else calcCur = "-" + calcCur;
+    }
+  } else if (k == "%") {
+    calcCur = calcFmt(atof(calcCur.c_str()) / 100.0);
+    calcErr = (calcCur == "Error");
+    calcFresh = false;
+  } else if (k == "+" || k == "-" || k == "*" || k == "/") {
+    if (calcOp && !calcFresh) {
+      double r;
+      if (!calcApply(calcAcc, calcOp, atof(calcCur.c_str()), r) || isinf(r)) {
+        calcErr = true;
+        calcCur = "Error";
+        calcExpr = "";
+        calcOp = 0;
+        calcFresh = true;
+        return;
+      }
+      calcAcc = r;
+      calcCur = calcFmt(r);
+    } else if (!calcOp) {
+      calcAcc = atof(calcCur.c_str());
+    }
+    calcOp = c;
+    calcFresh = true;
+    calcExpr = calcFmt(calcAcc) + " " + calcSym(calcOp);
+  } else if (k == "=") {
+    if (calcOp) {
+      double b = atof(calcCur.c_str());
+      double r;
+      String ex = calcFmt(calcAcc) + " " + calcSym(calcOp) + " " + calcFmt(b) + " =";
+      if (!calcApply(calcAcc, calcOp, b, r) || isinf(r)) {
+        calcErr = true;
+        calcCur = "Error";
+        calcExpr = "";
+      } else {
+        calcCur = calcFmt(r);
+        calcExpr = ex;
+      }
+      calcOp = 0;
+      calcFresh = true;
+    }
+  }
+}
+
+void drawCalcKey(int r, int c, bool pressed) {
+  if (r == 4 && c == 1) return;  // covered by the wide zero key
+  const char* k = CALC_KEYS[r][c];
+  bool isOp = (c == 3);
+  bool isFn = (r == 0 && c < 3);
+  bool wide = (r == 4 && c == 0);
+  int x = 12 + c * 76, y = 150 + r * 62, w = wide ? 144 : 68, h = 54;
+
+  uint16_t orange = c565(255, 159, 10), white = c565(255, 255, 255), black = c565(0, 0, 0);
+  uint16_t face, txt;
+  if (isOp) {
+    bool active = (calcOp != 0 && calcFresh && k[0] == calcOp);
+    face = pressed ? c565(255, 200, 120) : (active ? white : orange);
+    txt = active ? orange : white;
+  } else if (isFn) {
+    face = pressed ? c565(215, 215, 220) : c565(165, 165, 170);
+    txt = black;
+  } else {
+    face = pressed ? c565(115, 115, 120) : c565(51, 51, 54);
+    txt = white;
+  }
+
+  String lbl = k;
+  if (lbl == "*") lbl = "x";
+  gfx->fillRoundRect(x, y, w, h, 27, face);
+  gfx->setTextDatum(lgfx::middle_center);
+  gfx->setTextColor(txt);
+  gfx->drawString(lbl, wide ? x + 34 : x + w / 2, y + h / 2, 4);
+}
+
+void drawCalc(int anim) {
+  beginFull();
+  gfx->fillScreen(c565(0, 0, 0));
+  drawBack(c565(255, 159, 10));
+
+  gfx->setTextDatum(lgfx::bottom_right);
+  gfx->setTextColor(c565(150, 150, 155));
+  gfx->drawString(calcExpr, 308, 92, 2);
+
+  gfx->setTextSize(calcCur.length() <= 9 ? 2 : 1);
+  gfx->setTextDatum(lgfx::bottom_right);
+  gfx->setTextColor(c565(255, 255, 255));
+  gfx->drawString(calcCur, 308, 142, 4);
+  gfx->setTextSize(1);
+
+  for (int r = 0; r < 5; r++)
+    for (int c = 0; c < 4; c++) drawCalcKey(r, c, false);
+  endFull(anim);
+}
+
+void handleCalcTouch(int tx, int ty) {
+  if (ty < 150 || tx < 12) return;
+  int r = (ty - 150) / 62;
+  if (r > 4 || (ty - 150) % 62 >= 54) return;
+  int c;
+  if (r == 4 && tx < 156) {
+    c = 0;  // wide zero key
+  } else {
+    c = (tx - 12) / 76;
+    if (c > 3 || (tx - 12) % 76 >= 68) return;
+  }
+  gfx = &tft;
+  drawCalcKey(r, c, true);
+  delay(40);
+  calcPress(CALC_KEYS[r][c]);
+  drawCalc(0);
+}
+
+// =====================================================
+// NOTES
+void saveNotes() {
+  for (int i = 0; i < MAX_NOTES; i++) {
+    String key = "n" + String(i);
+    preferences.putString(key.c_str(), i < noteCount ? notes[i] : String(""));
+  }
+}
+
+void loadNotes() {
+  noteCount = 0;
+  for (int i = 0; i < MAX_NOTES; i++) {
+    String key = "n" + String(i);
+    String s = preferences.getString(key.c_str(), "");
+    if (s.length() > 0 && noteCount < MAX_NOTES) notes[noteCount++] = s;
+  }
+}
+
+void removeNote(int idx) {
+  if (idx < 0 || idx >= noteCount) return;
+  for (int i = idx; i < noteCount - 1; i++) notes[i] = notes[i + 1];
+  noteCount--;
+  notes[noteCount] = "";
+}
+
+void finishNote() {
+  if (curNote >= 0 && curNote < noteCount) {
+    notes[curNote].trim();
+    if (notes[curNote].length() == 0) removeNote(curNote);
+  }
+  curNote = -1;
+  saveNotes();
+}
+
+void drawNotesList(int anim) {
+  beginFull();
+  gfx->fillScreen(bgColor);
+  drawHeader("Notes");
+  uint16_t white = c565(255, 255, 255);
+  gfx->fillCircle(290, 25, 14, noteCount < MAX_NOTES ? accentColor : sepColor);
+  gfx->fillRect(283, 24, 14, 3, white);
+  gfx->fillRect(289, 18, 3, 14, white);
+
+  if (noteCount == 0) {
+    drawAppIcon(8, 128, 150, 64);
+    gfx->setTextDatum(lgfx::middle_center);
+    gfx->setTextColor(textColor);
+    gfx->drawString("No notes yet", 160, 250, 4);
+    gfx->setTextColor(subColor);
+    gfx->drawString("Tap + to write one", 160, 282, 2);
+  }
+  for (int i = 0; i < noteCount; i++) {
+    int y = 62 + i * 50;
+    gfx->fillRoundRect(12, y, 296, 44, 12, cardColor);
+    String t = notes[i];
+    if (t.length() > 26) t = t.substring(0, 25) + "..";
+    gfx->setTextDatum(lgfx::middle_left);
+    gfx->setTextColor(textColor);
+    gfx->drawString(t, 24, y + 15, 2);
+    gfx->setTextColor(subColor);
+    gfx->drawString(String(notes[i].length()) + " characters", 24, y + 33, 1);
+    gfx->setTextDatum(lgfx::middle_center);
+    gfx->drawString(">", 296, y + 22, 2);
+  }
+  endFull(anim);
+}
+
+void handleNotesListTouch(int tx, int ty) {
+  if (ty < 50 && tx > 250) {
+    if (noteCount < MAX_NOTES) {
+      notes[noteCount] = "";
+      curNote = noteCount;
+      noteCount++;
+      noteShift = false;
+      currentScreen = NOTE_EDIT;
+      drawNoteEdit(1);
+    }
+    return;
+  }
+  if (ty >= 62) {
+    int i = (ty - 62) / 50;
+    if (i < noteCount && (ty - 62) % 50 < 44) {
+      curNote = i;
+      noteShift = false;
+      currentScreen = NOTE_EDIT;
+      drawNoteEdit(1);
+    }
+  }
+}
+
+void drawNoteTextArea() {
+  gfx->fillRoundRect(10, 58, 300, 154, 12, cardColor);
+  gfx->drawRoundRect(10, 58, 300, 154, 12, sepColor);
+  if (curNote < 0 || curNote >= noteCount) return;
+  gfx->setTextDatum(lgfx::top_left);
+  if (notes[curNote].length() == 0) {
+    gfx->setTextColor(subColor);
+    gfx->drawString("Start typing...", 22, 68, 2);
+  } else {
+    std::vector<String> lines;
+    wrapText(notes[curNote] + "|", 32, lines);
+    int maxL = 7;
+    int start = (int)lines.size() > maxL ? (int)lines.size() - maxL : 0;
+    gfx->setTextColor(textColor);
+    for (int k = start; k < (int)lines.size(); k++)
+      gfx->drawString(lines[k], 22, 66 + (k - start) * 18, 2);
+  }
+  gfx->setTextDatum(lgfx::bottom_right);
+  gfx->setTextColor(subColor);
+  gfx->drawString(String(notes[curNote].length()) + "/" + String(NOTE_LEN), 300, 207, 1);
+}
+
+void drawNoteEdit(int anim) {
+  beginFull();
+  gfx->fillScreen(bgColor);
+  drawHeader("Note");
+  gfx->setTextDatum(lgfx::middle_right);
+  gfx->setTextColor(redColor);
+  gfx->drawString("Delete", 308, 25, 2);
+  drawNoteTextArea();
+  drawGoodKeyboard(noteShift);
+  endFull(anim);
+}
+
+void handleNoteEditTouch(int tx, int ty) {
+  if (curNote < 0 || curNote >= noteCount) return;
+  if (ty < 50 && tx > 230) {             // Delete
+    removeNote(curNote);
+    curNote = -1;
+    saveNotes();
+    currentScreen = NOTES_LIST;
+    drawNotesList(2);
+    return;
+  }
+  if (ty >= 430 && ty < 475) {           // Done
+    finishNote();
+    currentScreen = NOTES_LIST;
+    drawNotesList(2);
+    return;
+  }
+  if (handleKeyboardKey(tx, ty, notes[curNote], noteShift)) {
+    if ((int)notes[curNote].length() > NOTE_LEN) notes[curNote].remove(NOTE_LEN);
+    drawNoteTextArea();
+  }
+  delay(40);
+}
+
+// =====================================================
+// CLOCK APP (clock / timer / stopwatch)
+long timerRemainingMs() {
+  if (timerRunning) {
+    long r = (long)(timerEndMs - millis());
+    return r > 0 ? r : 0;
+  }
+  return timerRemainMs;
+}
+
+unsigned long swElapsed() {
+  return swRunning ? swAccum + (millis() - swStartMs) : swAccum;
+}
+
+String timerText(long ms) {
+  long s = (ms + 999) / 1000;
+  char b[12];
+  snprintf(b, sizeof(b), "%02ld:%02ld", s / 60, s % 60);
+  return String(b);
+}
+
+String swText(unsigned long ms) {
+  unsigned long t = ms / 100;
+  char b[16];
+  snprintf(b, sizeof(b), "%02lu:%02lu.%lu", (t / 600) % 100, (t / 10) % 60, t % 10);
+  return String(b);
+}
+
+void handLine(float angDeg, float len, int th, uint16_t col) {
+  float a = angDeg * 0.0174533f;
+  int x1 = CLK_CX + (int)(cosf(a) * len);
+  int y1 = CLK_CY + (int)(sinf(a) * len);
+  thickLine(CLK_CX, CLK_CY, x1, y1, th, col);
+}
+
+void drawHandsAt(int h, int m, int s, uint16_t cH, uint16_t cM, uint16_t cS) {
+  float ha = ((h % 12) + m / 60.0f) * 30.0f - 90.0f;
+  float ma = (m + s / 60.0f) * 6.0f - 90.0f;
+  float sa = s * 6.0f - 90.0f;
+  handLine(ha, 50, 5, cH);
+  handLine(ma, 74, 3, cM);
+  float a = sa * 0.0174533f;
+  int x1 = CLK_CX + (int)(cosf(a) * 84), y1 = CLK_CY + (int)(sinf(a) * 84);
+  int x0 = CLK_CX - (int)(cosf(a) * 16), y0 = CLK_CY - (int)(sinf(a) * 16);
+  gfx->drawLine(x0, y0, x1, y1, cS);
+  gfx->drawLine(x0 + 1, y0, x1 + 1, y1, cS);
+}
+
+void drawAnalogDecor() {
+  for (int i = 0; i < 60; i++) {
+    float a = (i * 6 - 90) * 0.0174533f;
+    if (i % 5 == 0) {
+      int x0 = CLK_CX + (int)(cosf(a) * (CLK_R - 16)), y0 = CLK_CY + (int)(sinf(a) * (CLK_R - 16));
+      int x1 = CLK_CX + (int)(cosf(a) * (CLK_R - 6)), y1 = CLK_CY + (int)(sinf(a) * (CLK_R - 6));
+      thickLine(x0, y0, x1, y1, 2, textColor);
+    } else {
+      gfx->fillCircle(CLK_CX + (int)(cosf(a) * (CLK_R - 6)), CLK_CY + (int)(sinf(a) * (CLK_R - 6)), 1, subColor);
+    }
+  }
+  gfx->setTextDatum(lgfx::middle_center);
+  gfx->setTextColor(textColor);
+  gfx->drawString("12", CLK_CX, CLK_CY - CLK_R + 32, 2);
+  gfx->drawString("3", CLK_CX + CLK_R - 32, CLK_CY, 2);
+  gfx->drawString("6", CLK_CX, CLK_CY + CLK_R - 32, 2);
+  gfx->drawString("9", CLK_CX - CLK_R + 32, CLK_CY, 2);
+}
+
+void drawHub() {
+  gfx->fillCircle(CLK_CX, CLK_CY, 5, textColor);
+  gfx->fillCircle(CLK_CX, CLK_CY, 2, redColor);
+}
+
+void updateAnalog() {
+  struct tm ti;
+  if (!getLocalTime(&ti, 0)) return;
+  if (prevS >= 0) drawHandsAt(prevH, prevM, prevS, cardColor, cardColor, cardColor);
+  drawAnalogDecor();
+  drawHandsAt(ti.tm_hour, ti.tm_min, ti.tm_sec, textColor, textColor, redColor);
+  drawHub();
+  prevH = ti.tm_hour;
+  prevM = ti.tm_min;
+  prevS = ti.tm_sec;
+}
+
+void drawClockFace() {
+  const char* dayNames[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+  const char* monNames[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+  gfx->fillCircle(CLK_CX, CLK_CY, CLK_R + 4, sepColor);
+  gfx->fillCircle(CLK_CX, CLK_CY, CLK_R, cardColor);
+  drawAnalogDecor();
+
+  struct tm ti;
+  if (getLocalTime(&ti, 0)) {
+    drawHandsAt(ti.tm_hour, ti.tm_min, ti.tm_sec, textColor, textColor, redColor);
+    prevH = ti.tm_hour;
+    prevM = ti.tm_min;
+    prevS = ti.tm_sec;
+    clkLastSec = ti.tm_sec;
+    clkLastMin = ti.tm_min;
+  } else {
+    prevS = -1;
+  }
+  drawHub();
+
+  gfx->setTextDatum(lgfx::middle_center);
+  gfx->setTextColor(textColor);
+  if (getLocalTime(&ti, 0)) {
+    String ap;
+    String t = fmtTime12(ti, ap);
+    gfx->drawString(t, 125, 372, 7);
+    gfx->drawString(ap, 272, 384, 4);
+    gfx->setTextColor(subColor);
+    gfx->drawString(String(dayNames[ti.tm_wday]) + ", " + monNames[ti.tm_mon] + " " + String(ti.tm_mday), 160, 425, 4);
+  } else {
+    gfx->drawString("--:--", 160, 372, 7);
+    gfx->setTextColor(subColor);
+    gfx->drawString(wifiConnected ? "Setting time..." : "Connect WiFi to set time", 160, 425, 2);
+  }
+}
+
+void drawClockTabs() {
+  const char* labels[3] = {"Clock", "Timer", "Stopwatch"};
+  gfx->fillRoundRect(12, 58, 296, 36, 18, cardColor);
+  for (int i = 0; i < 3; i++) {
+    int x = 14 + i * 97;
+    if (i == clockTab) gfx->fillRoundRect(x, 60, 97, 32, 16, accentColor);
+    gfx->setTextDatum(lgfx::middle_center);
+    gfx->setTextColor(i == clockTab ? c565(255, 255, 255) : textColor);
+    gfx->drawString(labels[i], x + 48, 76, 2);
+  }
+}
+
+void bigButton(int x, int y, int w, int h, const char* label, uint16_t face, uint16_t txt) {
+  gfx->fillRoundRect(x, y, w, h, h / 2, face);
+  gfx->setTextDatum(lgfx::middle_center);
+  gfx->setTextColor(txt);
+  gfx->drawString(label, x + w / 2, y + h / 2, 4);
+}
+
+void chipButton(int x, int y, int w, int h, const char* label, uint16_t face, uint16_t txt) {
+  gfx->fillRoundRect(x, y, w, h, 12, face);
+  gfx->setTextDatum(lgfx::middle_center);
+  gfx->setTextColor(txt);
+  gfx->drawString(label, x + w / 2, y + h / 2, 2);
+}
+
+void drawTimerProgress() {
+  long total = timerSetSec * 1000;
+  float frac = total > 0 ? (float)timerRemainingMs() / total : 0;
+  if (frac > 1) frac = 1;
+  gfx->fillRoundRect(12, 190, 296, 8, 4, sepColor);
+  int w = (int)(296 * frac);
+  if (w > 0) gfx->fillRoundRect(12, 190, w < 8 ? 8 : w, 8, 4, accentColor);
+}
+
+void drawTimerUI() {
+  bool flash = timerDone && timerFlash;
+  uint16_t white = c565(255, 255, 255);
+  if (flash) gfx->fillRect(0, 98, 320, 382, redColor);
+  gfx->setTextDatum(lgfx::middle_center);
+  gfx->setTextColor(flash ? white : textColor);
+  gfx->drawString(timerText(timerRemainingMs()), 160, 145, 7);
+  drawTimerProgress();
+
+  const char* adj[4] = {"-1m", "-10s", "+10s", "+1m"};
+  for (int i = 0; i < 4; i++)
+    chipButton(12 + i * 76, 214, 68, 40, adj[i], cardColor, timerRunning ? subColor : textColor);
+
+  const char* pre[4] = {"1m", "5m", "10m", "30m"};
+  const long preSec[4] = {60, 300, 600, 1800};
+  for (int i = 0; i < 4; i++) {
+    bool sel = (timerSetSec == preSec[i]);
+    chipButton(12 + i * 76, 264, 68, 36, pre[i], sel ? accentColor : cardColor, sel ? white : (timerRunning ? subColor : textColor));
+  }
+
+  bool paused = !timerRunning && timerRemainMs > 0 && timerRemainMs < timerSetSec * 1000;
+  bigButton(12, 322, 140, 60, "Reset", c565(142, 142, 147), white);
+  const char* goLabel = timerRunning ? "Pause" : (paused ? "Resume" : "Start");
+  bigButton(168, 322, 140, 60, goLabel, timerRunning ? c565(255, 159, 10) : greenColor, white);
+
+  const char* st = timerDone ? "Time's up!" : (timerRunning ? "Running" : (paused ? "Paused" : "Ready"));
+  gfx->setTextDatum(lgfx::middle_center);
+  gfx->setTextColor(flash ? white : (timerDone ? redColor : subColor));
+  gfx->drawString(st, 160, 415, 4);
+}
+
+void drawTimerLive() {
+  gfx->fillRect(0, 118, 320, 56, bgColor);
+  gfx->setTextDatum(lgfx::middle_center);
+  gfx->setTextColor(textColor);
+  gfx->drawString(timerText(timerRemainingMs()), 160, 145, 7);
+  drawTimerProgress();
+}
+
+void drawSwLive() {
+  gfx->fillRect(0, 118, 320, 56, bgColor);
+  gfx->setTextDatum(lgfx::middle_center);
+  gfx->setTextColor(textColor);
+  gfx->drawString(swText(swElapsed()), 160, 145, 7);
+}
+
+void drawSwUI() {
+  uint16_t white = c565(255, 255, 255);
+  gfx->setTextDatum(lgfx::middle_center);
+  gfx->setTextColor(textColor);
+  gfx->drawString(swText(swElapsed()), 160, 145, 7);
+
+  bool canReset = (swElapsed() > 0);
+  if (swRunning) bigButton(12, 215, 140, 56, "Lap", c565(142, 142, 147), white);
+  else bigButton(12, 215, 140, 56, "Reset", canReset ? c565(142, 142, 147) : sepColor, white);
+  bigButton(168, 215, 140, 56, swRunning ? "Stop" : "Start", swRunning ? redColor : greenColor, white);
+
+  if (swLapCount > 0) {
+    gfx->setTextDatum(lgfx::middle_left);
+    gfx->setTextColor(subColor);
+    gfx->drawString("Laps", 16, 292, 2);
+  }
+  for (int k = 0; k < 5 && k < swLapCount; k++) {
+    int idx = swLapCount - 1 - k;
+    unsigned long split = swLaps[idx] - (idx > 0 ? swLaps[idx - 1] : 0);
+    int y = 308 + k * 32;
+    gfx->fillRoundRect(12, y, 296, 28, 10, cardColor);
+    gfx->setTextDatum(lgfx::middle_left);
+    gfx->setTextColor(textColor);
+    gfx->drawString("Lap " + String(idx + 1), 24, y + 14, 2);
+    gfx->setTextDatum(lgfx::middle_right);
+    gfx->drawString(swText(split), 296, y + 14, 2);
+  }
+}
+
+void drawClock(int anim) {
+  beginFull();
+  gfx->fillScreen(bgColor);
+  drawHeader("Clock");
+  drawClockTabs();
+  if (clockTab == 0) drawClockFace();
+  else if (clockTab == 1) drawTimerUI();
+  else drawSwUI();
+  endFull(anim);
+}
+
+void clockTick() {
+  if (clockTab == 0) {
+    struct tm ti;
+    if (!getLocalTime(&ti, 0)) return;
+    if (ti.tm_sec != clkLastSec) {
+      clkLastSec = ti.tm_sec;
+      if (ti.tm_min != clkLastMin) {
+        clkLastMin = ti.tm_min;
+        drawClock(0);
+      } else {
+        updateAnalog();
+      }
+    }
+  } else if (clockTab == 1) {
+    if (timerDone && millis() - timerDoneAt < 20000) {
+      if (millis() - timerLastFlash >= 500) {
+        timerLastFlash = millis();
+        timerFlash = !timerFlash;
+        drawClock(0);
+      }
+    } else if (timerDone && timerFlash) {
+      timerFlash = false;
+      drawClock(0);
+    } else if (timerRunning) {
+      long rs = (timerRemainingMs() + 999) / 1000;
+      if (rs != lastTimerSec) {
+        lastTimerSec = rs;
+        drawTimerLive();
+      }
+    }
+  } else {
+    if (swRunning) drawSwLive();
+  }
+}
+
+void handleClockTouch(int tx, int ty) {
+  // tabs
+  if (ty >= 56 && ty < 96) {
+    int t = (tx - 12) / 99;
+    if (t < 0) t = 0;
+    if (t > 2) t = 2;
+    if (t != clockTab) {
+      clockTab = t;
+      clkLastSec = -1;
+      clkLastMin = -1;
+      lastTimerSec = -1;
+      timerFlash = false;
+      drawClock(0);
+    }
+    return;
+  }
+
+  if (clockTab == 1) {
+    const long adjDelta[4] = {-60, -10, 10, 60};
+    const long preSec[4] = {60, 300, 600, 1800};
+    int col = (tx - 12) / 76;
+    bool inCol = (tx >= 12 && col >= 0 && col < 4 && (tx - 12) % 76 < 68);
+
+    if (ty >= 214 && ty < 254 && inCol) {
+      if (!timerRunning) {
+        timerSetSec = constrain(timerSetSec + adjDelta[col], 10L, 5999L);
+        timerRemainMs = timerSetSec * 1000;
+        timerDone = false;
+        timerFlash = false;
+        drawClock(0);
+      }
+    } else if (ty >= 264 && ty < 300 && inCol) {
+      if (!timerRunning) {
+        timerSetSec = preSec[col];
+        timerRemainMs = timerSetSec * 1000;
+        timerDone = false;
+        timerFlash = false;
+        drawClock(0);
+      }
+    } else if (ty >= 322 && ty < 382) {
+      if (tx < 160) {                                   // Reset
+        timerRunning = false;
+        timerDone = false;
+        timerFlash = false;
+        timerRemainMs = timerSetSec * 1000;
+      } else {                                          // Start / Pause / Resume
+        if (timerRunning) {
+          timerRemainMs = timerRemainingMs();
+          timerRunning = false;
+        } else {
+          if (timerDone || timerRemainMs <= 0) {
+            timerDone = false;
+            timerFlash = false;
+            timerRemainMs = timerSetSec * 1000;
+          }
+          timerEndMs = millis() + timerRemainMs;
+          timerRunning = true;
+          lastTimerSec = -1;
+        }
+      }
+      drawClock(0);
+    }
+  } else if (clockTab == 2) {
+    if (ty >= 215 && ty < 271) {
+      if (tx >= 168) {                                  // Start / Stop
+        if (swRunning) {
+          swAccum += millis() - swStartMs;
+          swRunning = false;
+        } else {
+          swStartMs = millis();
+          swRunning = true;
+        }
+      } else if (tx < 160) {                            // Lap / Reset
+        if (swRunning) {
+          if (swLapCount < 20) swLaps[swLapCount++] = swElapsed();
+        } else {
+          swAccum = 0;
+          swLapCount = 0;
+        }
+      }
+      drawClock(0);
+    }
+  }
+}
+
+// =====================================================
+// SOFTWARE UPDATE (checks a version.json on GitHub, installs firmware over WiFi)
+bool updCheck() {
+  updState = U_CHECKING;
+  updMsg = "";
+  updAvail = false;
+
+  if (!wifiConnected) {
+    updState = U_ERROR;
+    updMsg = "No WiFi connection";
+    return false;
+  }
+  if (String(UPDATE_URL).indexOf("YOUR_") >= 0) {
+    updState = U_ERROR;
+    updMsg = "Update link not set up yet";
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(10000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.begin(client, String(UPDATE_URL) + "?t=" + String(millis()));   // ?t= skips GitHub's cache
+  int code = http.GET();
+
+  bool ok = false;
+  if (code == 200) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(2048);
+    DeserializationError err = deserializeJson(doc, payload);
+    if (!err) {
+      updNewBuild = doc["build"] | 0;
+      updNewVer = String((const char*)(doc["version"] | "?"));
+      updNotes = String((const char*)(doc["notes"] | ""));
+      updUrl = String((const char*)(doc["url"] | ""));
+      // Only download from GitHub's raw file host
+      if (!updUrl.startsWith("https://raw.githubusercontent.com/")) {
+        updState = U_ERROR;
+        updMsg = "Blocked: untrusted download link";
+      } else if (updNewBuild > FW_BUILD) {
+        updState = U_AVAIL;
+        updAvail = true;
+        ok = true;
+      } else {
+        updState = U_UPTODATE;
+        ok = true;
+      }
+    } else {
+      updState = U_ERROR;
+      updMsg = "Couldn't read version info";
+    }
+  } else if (code > 0) {
+    updState = U_ERROR;
+    updMsg = "HTTP " + String(code);
+  } else {
+    updState = U_ERROR;
+    updMsg = http.errorToString(code);
+  }
+  http.end();
+  return ok;
+}
+
+void updProgress(int cur, int total) {
+  int pct = total > 0 ? (int)((int64_t)cur * 100 / total) : 0;
+  if (pct == updLastPct) return;
+  updLastPct = pct;
+  lgfx::LGFXBase* save = gfx;
+  gfx = &tft;
+  tft.fillRoundRect(30, 300, 260, 14, 7, sepColor);
+  int w = 260 * pct / 100;
+  if (w > 0) tft.fillRoundRect(30, 300, w < 14 ? 14 : w, 14, 7, accentColor);
+  tft.fillRect(0, 322, 320, 30, bgColor);
+  tft.setTextDatum(lgfx::middle_center);
+  tft.setTextColor(textColor);
+  tft.drawString(String(pct) + "%", 160, 336, 4);
+  gfx = save;
+}
+
+void updInstall() {
+  updState = U_INSTALL;
+  updLastPct = -1;
+  drawUpdate(0);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  httpUpdate.rebootOnUpdate(false);
+  httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  httpUpdate.onProgress(updProgress);
+  t_httpUpdate_return r = httpUpdate.update(client, updUrl);
+
+  if (r == HTTP_UPDATE_OK) {
+    gfx = &tft;
+    tft.fillRect(0, 230, 320, 140, bgColor);
+    tft.setTextDatum(lgfx::middle_center);
+    tft.setTextColor(greenColor);
+    tft.drawString("Installed!", 160, 280, 4);
+    tft.setTextColor(subColor);
+    tft.drawString("Restarting...", 160, 320, 2);
+    delay(1500);
+    ESP.restart();
+  } else {
+    updState = U_ERROR;
+    updMsg = (r == HTTP_UPDATE_NO_UPDATES) ? String("No update found") : httpUpdate.getLastErrorString();
+    drawUpdate(0);
+  }
+}
+
+void openUpdate() {
+  currentScreen = UPDATE;
+  updState = U_CHECKING;
+  drawUpdate(1);
+  updCheck();
+  drawUpdate(0);
+}
+
+void drawUpdate(int anim) {
+  beginFull();
+  uint16_t white = c565(255, 255, 255);
+  gfx->fillScreen(bgColor);
+  drawHeader("Update");
+
+  // big icon
+  gfx->fillCircle(160, 112, 42, accentColor);
+  gfx->fillRect(155, 90, 11, 24, white);
+  gfx->fillTriangle(138, 112, 182, 112, 160, 136, white);
+
+  gfx->setTextDatum(lgfx::middle_center);
+  gfx->setTextColor(textColor);
+  gfx->drawString("Version " + String(FW_VERSION) + "  (build " + String(FW_BUILD) + ")", 160, 180, 2);
+
+  const char* btn = nullptr;
+  uint16_t btnCol = accentColor;
+
+  if (updState == U_CHECKING) {
+    gfx->setTextColor(subColor);
+    gfx->drawString("Checking for updates...", 160, 225, 4);
+    btn = "Checking...";
+    btnCol = sepColor;
+  } else if (updState == U_UPTODATE) {
+    gfx->setTextColor(greenColor);
+    gfx->drawString("You're up to date", 160, 225, 4);
+    btn = "Check again";
+  } else if (updState == U_AVAIL) {
+    gfx->setTextColor(textColor);
+    gfx->drawString("Update available", 160, 215, 4);
+    gfx->setTextColor(accentColor);
+    gfx->drawString("Version " + updNewVer + "  (build " + String(updNewBuild) + ")", 160, 245, 2);
+    if (updNotes.length()) {
+      std::vector<String> lines;
+      wrapText(updNotes, 38, lines);
+      gfx->setTextColor(subColor);
+      for (int i = 0; i < (int)lines.size() && i < 5; i++)
+        gfx->drawString(lines[i], 160, 275 + i * 18, 2);
+    }
+    btn = "Install update";
+    btnCol = greenColor;
+  } else if (updState == U_ERROR) {
+    gfx->setTextColor(redColor);
+    gfx->drawString("Couldn't update", 160, 220, 4);
+    std::vector<String> lines;
+    wrapText(updMsg, 36, lines);
+    gfx->setTextColor(subColor);
+    for (int i = 0; i < (int)lines.size() && i < 4; i++)
+      gfx->drawString(lines[i], 160, 252 + i * 18, 2);
+    btn = "Try again";
+  } else if (updState == U_INSTALL) {
+    gfx->setTextColor(textColor);
+    gfx->drawString("Installing...", 160, 225, 4);
+    gfx->setTextColor(subColor);
+    gfx->drawString("Keep the phone powered on", 160, 258, 2);
+    gfx->fillRoundRect(30, 300, 260, 14, 7, sepColor);
+  } else {
+    gfx->setTextColor(subColor);
+    gfx->drawString("Tap below to check", 160, 225, 4);
+    btn = "Check for updates";
+  }
+
+  if (btn) {
+    gfx->fillRoundRect(40, 380, 240, 50, 25, btnCol);
+    gfx->setTextDatum(lgfx::middle_center);
+    gfx->setTextColor(white);
+    gfx->drawString(btn, 160, 405, 2);
+  }
+  endFull(anim);
+}
+
+void handleUpdateTouch(int tx, int ty) {
+  if (ty >= 380 && ty < 430 && tx >= 40 && tx < 280) {
+    if (updState == U_AVAIL) {
+      updInstall();
+    } else if (updState != U_CHECKING && updState != U_INSTALL) {
+      updState = U_CHECKING;
+      drawUpdate(0);
+      updCheck();
+      drawUpdate(0);
+    }
+  }
+}
+
+// =====================================================
+// SETTINGS
+void drawBrightnessSlider() {
+  gfx->fillRect(0, 54, 320, 64, bgColor);
+  gfx->setTextDatum(lgfx::top_left);
+  gfx->setTextColor(textColor);
+  gfx->drawString("Brightness", 20, 56, 2);
+  int pct = (brightness - 30) * 100 / 225;
+  gfx->setTextDatum(lgfx::top_right);
+  gfx->setTextColor(subColor);
+  gfx->drawString(String(pct) + "%", 300, 56, 2);
+  int kx = 40 + (brightness - 30) * 240 / 225;
+  gfx->fillCircle(22, 98, 4, subColor);
+  gfx->fillCircle(300, 98, 8, subColor);
+  gfx->fillRoundRect(40, 93, 240, 10, 5, sepColor);
+  gfx->fillRoundRect(40, 93, kx - 40 + 2, 10, 5, accentColor);
+  gfx->fillCircle(kx, 98, 13, c565(255, 255, 255));
+  gfx->drawCircle(kx, 98, 13, sepColor);
+}
+
+void drawSettingsScreen(int anim) {
+  beginFull();
+  gfx->fillScreen(bgColor);
+  drawHeader("Settings");
+  drawBrightnessSlider();
+
+  drawRowBase(120, "Dark mode", 0);
+  drawToggle(248, 128, darkTheme);
+
+  drawRowBase(168, "Wallpaper", 1);
+  drawRowValue(168, WALLS[wallIdx].name);
+
+  drawRowBase(216, "WiFi", 2);
+  String w = wifiConnected ? wifiSSID : String("Not connected");
+  if (w.length() > 14) w = w.substring(0, 13) + "..";
+  drawRowValue(216, w);
+
+  drawRowBase(264, "Lock PIN", 4);
+  drawRowValue(264, lockPin.length() > 0 ? "On" : "Off");
+
+  drawRowBase(312, "Metric units", 5);
+  drawToggle(248, 320, useMetric);
+
+  drawRowBase(360, "Location", 6);
+  String p = wxPlace;
+  if (p.length() > 14) p = p.substring(0, 13) + "..";
+  drawRowValue(360, p);
+
+  drawRowBase(408, "Software update", 7);
+  if (updAvail) {
+    gfx->setTextDatum(lgfx::middle_right);
+    gfx->setTextColor(redColor);
+    gfx->drawString("Available", 282, 429, 2);
+    gfx->setTextDatum(lgfx::middle_center);
+    gfx->setTextColor(subColor);
+    gfx->drawString(">", 296, 429, 2);
+  } else {
+    drawRowValue(408, "v" + String(FW_VERSION));
+  }
+
+  endFull(anim);
+}
+
+void saveSettings() {
+  preferences.putBool("dark", darkTheme);
+  preferences.putInt("bright", brightness);
+  preferences.putBool("metric", useMetric);
+  preferences.putFloat("wxlat", wxLat);
+  preferences.putFloat("wxlon", wxLon);
+  preferences.putString("wxplace", wxPlace);
+  preferences.putInt("wall", wallIdx);
+}
+
+void loadSettings() {
+  darkTheme = preferences.getBool("dark", false);
+  brightness = preferences.getInt("bright", 200);
+  wifiSSID = preferences.getString("ssid", "");
+  wifiPASS = preferences.getString("pass", "");
+  useMetric = preferences.getBool("metric", false);
+  wxLat = preferences.getFloat("wxlat", 34.6826);
+  wxLon = preferences.getFloat("wxlon", -85.8044);
+  wxPlace = preferences.getString("wxplace", "Pisgah, AL");
+  lockPin = preferences.getString("pin", "1234");
+  snBest = preferences.getInt("best", 0);
+  wallIdx = preferences.getInt("wall", 0);
+  if (wallIdx < 0 || wallIdx >= WALL_COUNT) wallIdx = 0;
+  loadNotes();
+}
+
+void tryAutoConnect() {
+  if (wifiSSID.length() > 0) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(wifiSSID.c_str(), wifiPASS.c_str());
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 8000) delay(200);
+    wifiConnected = (WiFi.status() == WL_CONNECTED);
+  }
+}
+
+void scanWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+  int found = WiFi.scanNetworks();
+  if (found < 0) found = 0;
+  networkCount = min(found, 15);
+  for (int i = 0; i < networkCount; i++) {
+    networks[i] = WiFi.SSID(i);
+    networkRssi[i] = WiFi.RSSI(i);
+    networkSecure[i] = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+  }
+}
+
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiSSID.c_str(), wifiPASS.c_str());
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) delay(200);
+  wifiConnected = (WiFi.status() == WL_CONNECTED);
+  if (wifiConnected) syncTime();
+}
+
+void applyTheme() {
+  accentColor = c565(10, 132, 255);
+  greenColor = c565(52, 199, 89);
+  redColor = c565(255, 69, 58);
+  if (darkTheme) {
+    bgColor = c565(0, 0, 0);
+    textColor = c565(255, 255, 255);
+    cardColor = c565(28, 28, 30);
+    statusBarColor = c565(18, 18, 20);
+    subColor = c565(142, 142, 147);
+    sepColor = c565(56, 56, 58);
+    keyBgColor = c565(30, 30, 32);
+    keyFaceColor = c565(84, 84, 88);
+    keySpecialColor = c565(52, 52, 56);
+    keyShadowColor = c565(8, 8, 10);
+    bubbleAiColor = c565(44, 44, 46);
+  } else {
+    bgColor = c565(242, 242, 247);
+    textColor = c565(0, 0, 0);
+    cardColor = c565(255, 255, 255);
+    statusBarColor = c565(249, 249, 251);
+    subColor = c565(120, 120, 128);
+    sepColor = c565(210, 210, 216);
+    keyBgColor = c565(209, 212, 218);
+    keyFaceColor = c565(255, 255, 255);
+    keySpecialColor = c565(172, 178, 188);
+    keyShadowColor = c565(140, 143, 150);
+    bubbleAiColor = c565(229, 229, 234);
+  }
+}
+
+void setBrightness(int v) { tft.setBrightness(v); }
